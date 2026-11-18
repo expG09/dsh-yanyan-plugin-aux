@@ -2,10 +2,15 @@
     - id: aux
       name: 'dsh-yanyan-plugin-aux'
       config:
+        scopeSessions: []
         clockFile: 'G:\yanyan-workspace\report-cache\clock.md'
         clockIntervalHours: 6
         injectPerTurn: true
-        thresholds:
-          - 50
-          - 70
+        handoverPercent: 50
+        compactSoonPercent: 75
+        nearlyFullPercent: 90
+        rotateReminderMode: weekly
+        rotateReminderDays: 7
+        rotateReminderWeekday: 6
+        rotateReminderDayOfMonth: 1
         timeZone: Asia/Shanghai

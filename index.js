@@ -1,14 +1,33 @@
 /**
- * aux：给模型读上下文水位，顺带给时钟文件续行，外加 QQ 群会话换新。
+ * aux：给模型读上下文水位，顺带给时钟文件续行，按周期提醒换会话。
  *
- * 三件事：
- *   1. 每个 turn 的第一步注入一条水位读数；占比跨过阈值（默认 50/70）时各额外注入一次提醒
- *      （同一个会话里每个阈值只提醒一次）。
+ * 四件事：
+ *   1. 每个 turn 的第一步注入一条水位读数；占比跨过三档线时各额外注入一次对应提醒
+ *      （同一个会话里每档只提醒一次）：
+ *        - handoverPercent（默认 50）：该写交接了；
+ *        - compactSoonPercent（默认 75）：快到折叠线了；
+ *        - nearlyFullPercent（默认 90）：该换新会话了。
+ *      三档提醒不受 injectPerTurn 影响，该说照说。
  *   2. 按 clockIntervalHours 往 clockFile 追加一行 `YYYY-MM-DD HH:mm`，能读到水位时
  *      追加 ` 上下文 NN%`；进程启动时先补写一行。
- *   3. 设置页里的「QQ 群会话换新」改 `%USERPROFILE%\.dsh-qqbot\model-prefs.json` 里的
- *      sessionKey → sessionId 绑定：写前备份、原子写回、记一行审计日志。qqbot 只在启动时
- *      读这个文件，所以换新要重启桌面端（托盘退出再打开）才生效。
+ *   3. 换新提醒：**每次 pre-step 都检查**（不限第几步）；周期三选一（`rotateReminderMode`）：
+ *      - interval：距上次提醒满 `rotateReminderDays` 天（1–365）；
+ *      - weekly：上次提醒之后最近的、落在 `rotateReminderWeekday`（0=周日…6=周六）的自然日到了；
+ *      - monthly：上次提醒之后最近的、`rotateReminderDayOfMonth`（1–28）那个自然日到了。
+ *      「周几 / 几号」按 `timeZone` 算本地日期。从未提醒过（第一次运行）→ 立刻提醒。
+ *      到期就注入一次，并把时间写进 `%USERPROFILE%\.dsh\aux-state.json`；关机期间错过的那次，
+ *      下次打开的第一轮会补上，而且只补一次（写完时间就不到期了）。到点那一拍还会**另外**往
+ *      clockFile 写一行 `YYYY-MM-DD HH:mm · 该换会话`（能读到水位就再带 ` 上下文 NN%`）——
+ *      这行跟按 clockIntervalHours 写的常规时钟行是两回事，互不覆盖、也不去重。
+ *   4. 换新本身不在这里做：插件只提醒，动作交给外置脚本
+ *      `tools/rotate-qq-session.mjs`，所以本插件不读不写 qqbot 的任何存储。
+ *
+ * 生效范围（scopeSessions）是**全局**的，管上面所有注入，不只换新提醒：
+ *   空数组 = 所有会话都收；非空时只有会话 id 等于某一项、或以某一项开头的会话才收。
+ *   判定排在 pre-step 的最前面：不在范围里就直接返回，**一条都不注入**（连读数也不发），
+ *   也不推进读数门限、已提醒档位、换新提醒状态，免得范围外的会话把状态推着走。
+ *   时钟行不受影响——它按 clockIntervalHours 照常写，跟会话无关。
+ *   跳过时往诊断日志写一行 `skip scope session=<id>`，方便排查「这个会话怎么没读数」。
  *
  * 设置有两层：
  *   - cordis.patch.yml 里的 config 是出厂默认；
@@ -21,52 +40,63 @@
  * webServer 是可选的：有的 profile 不装它。路由改成运行时探测 ctx.get('webServer')，
  * 拿不到就只跳过 HTTP 接口，水位与时钟照常。
  */
-import z from '@deepseek-ai/schemastery';
-import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import {
   appendFileSync,
-  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
-  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { isRotateDue } from './lib/rotate-schedule.js';
 import {
-  listBindings,
-  mintSessionId,
-  parseSessionKey,
-  prefsPath,
-  rotateBinding,
-  rotationsPath,
-} from './lib/bindings.js';
-import { DEFAULT_SETTINGS, normalizeSettings, readSettings, writeSettings } from './lib/settings.js';
+  DEFAULT_SETTINGS,
+  inScope,
+  normalizeSettings,
+  readSettings,
+  writeSettings,
+} from './lib/settings.js';
 
 export const name = 'aux';
 
 /** 必需的服务：agent 注册表（pre-step 事件）与 token 计量。webServer 走运行时探测，不在这里。 */
 export const inject = ['agents', 'tokenMeter'];
 
-/** 与 cordis.patch.yml 里的 config 键一一对应，全部必填；它们只是设置文件的出厂默认。 */
-export const Config = z.object({
-  clockFile: z.string(),
-  clockIntervalHours: z.number(),
-  injectPerTurn: z.boolean(),
-  thresholds: z.array(z.number()),
-  timeZone: z.string(),
-});
+/**
+ * 刻意不声明 Config、也不 import 任何 @deepseek-ai 包。
+ *
+ * 这个插件是从工作区 link/junction 进 profile 的：Node 解析裸 import 时按真实路径
+ * (G:\...) 往上找 node_modules，那里没有 @deepseek-ai，于是加载阶段直接失败，
+ * 而且不会留下任何可见报错。所以保持自包含——只用 node 内置模块和相对导入；
+ * 配置校验与回落交给 lib/settings.js 的 normalizeSettings。
+ */
 
-/** 每个阈值给一句对应建议；自定义阈值按最近的一档取文案。 */
-function adviceFor(threshold) {
-  if (threshold >= 85) return '上下文很满了：立刻写交接、换新会话。';
-  if (threshold >= 70) return '该准备收尾：把结论写进交接，准备换新会话，别再开新的大活。';
-  if (threshold >= 50) return '留意上下文：长任务先把中间结论落盘。';
-  return '留意上下文占用。';
-}
+/**
+ * 三档提醒：每一档一句自己的话，语义各不相同。
+ *
+ * 文案里的 X 是**当前占比**，不是阈值本身——同一档线在一次会话里只会被跨过一次。
+ */
+const REMINDERS = Object.freeze([
+  {
+    key: 'handover',
+    percentKey: 'handoverPercent',
+    text: (percent) => `上下文 ${percent}%：该写交接了——长任务先把结论落盘，再往下做。`,
+  },
+  {
+    key: 'compactSoon',
+    percentKey: 'compactSoonPercent',
+    text: (percent) => `上下文 ${percent}%：快到折叠线了。折叠只留摘要，细节会丢；重要结论先落盘。`,
+  },
+  {
+    key: 'nearlyFull',
+    percentKey: 'nearlyFullPercent',
+    text: (percent) => `上下文 ${percent}%：快满了，该换新会话了。`,
+  },
+]);
 
 /** token 数按 K 显示，去掉无意义的 .0 尾巴；不足 1K 就报原数。 */
 function fmtTokens(value) {
@@ -103,11 +133,66 @@ function buildFormatter(timeZone) {
   }
 }
 
+/** 启动与注入的自检日志：写在 clock 同目录的 aux-debug.log，超过 200KB 就不再写。 */
+function makeDiag(clockFile) {
+  const file = clockFile ? join(dirname(clockFile), 'aux-debug.log') : '';
+  return (msg) => {
+    if (!file) return;
+    try {
+      mkdirSync(dirname(file), { recursive: true });
+      if (existsSync(file) && statSync(file).size > 200 * 1024) return;
+      appendFileSync(file, `${new Date().toISOString()} ${msg}\n`, 'utf8');
+    } catch {
+      /* 诊断日志写不了不影响插件 */
+    }
+  };
+}
+
+/**
+ * 换新提醒的状态：`%USERPROFILE%\.dsh\aux-state.json`。
+ *
+ * 这个文件只放状态、不放用户设置（设置永远在 aux-settings.json）。读不到、写不进
+ * 都不许影响会话：读失败当「从没提醒过」，写失败吞掉，宿主另有内存兜底。
+ */
+function makeStateStore(file) {
+  /** 返回 `{ lastRotateReminderAt }`，字段要么是 ISO 字符串要么是 null。 */
+  function read() {
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8'));
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return { lastRotateReminderAt: null };
+      }
+      const at = parsed.lastRotateReminderAt;
+      return { lastRotateReminderAt: typeof at === 'string' ? at : null };
+    } catch {
+      return { lastRotateReminderAt: null };
+    }
+  }
+
+  /** 写回状态；成功返回 true，失败 false（不抛）。 */
+  function write(state) {
+    try {
+      mkdirSync(dirname(file), { recursive: true });
+      const body = { lastRotateReminderAt: state.lastRotateReminderAt };
+      writeFileSync(file, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  return { read, write };
+}
+
 export function apply(ctx, config) {
+  const diag = makeDiag(config?.clockFile ?? '');
+  diag(`apply start clockFile=${config?.clockFile ?? '(none)'}`);
   /** patch 里的 config 规整后作为出厂默认；设置文件被删掉时回到这一份。 */
   const patchDefaults = normalizeSettings(config, DEFAULT_SETTINGS);
   /** 用户设置文件：设置页保存到这里，启动和每次热更新都读它。 */
   const settingsFile = join(homedir(), '.dsh', 'aux-settings.json');
+  /** 换新提醒的状态文件：只存 lastRotateReminderAt。 */
+  const stateStore = makeStateStore(join(homedir(), '.dsh', 'aux-state.json'));
 
   /** 文件指纹：有文件用 mtimeMs，没有就记 'missing'。 */
   function readStamp() {
@@ -128,8 +213,14 @@ export function apply(ctx, config) {
 
   /** 最近一次读到的水位，供时钟行使用；没读到就写纯时间。 */
   let lastPercent = null;
-  /** 每个会话已经提醒过的阈值，避免同一个坎反复说。 */
+  /** 每个会话已经提醒过的提醒档（handover / compactSoon / nearlyFull），避免同一档反复说。 */
   const notified = new Map();
+
+  /**
+   * 本进程内上次发换新提醒的时间（毫秒）。状态文件写不进去时靠它兜底，
+   * 免得每个 pre-step 都重复提醒一次。0 = 本进程还没提醒过。
+   */
+  let lastRotateReminderMs = 0;
 
   /** /api/aux 路由是否已挂上。webServer 是可选服务，启动时拿不到就在第一次 pre-step 再试一次。 */
   let routesMounted = false;
@@ -198,7 +289,23 @@ export function apply(ctx, config) {
     }
   }
 
-  /** 追加一行时钟；写失败（目录、权限、格式化器缺失）静默跳过。 */
+  /**
+   * 上次提醒的时间（毫秒），状态文件优先，其次本进程内存里的。
+   * 0 = 还没有任何记录（= 从未提醒过）。
+   *
+   * 内存那份是写状态失败时的兜底：免得状态写不进去，每个 pre-step 都重复提醒一次。
+   */
+  function lastRotateMs() {
+    const state = stateStore.read();
+    const fromFile =
+      state.lastRotateReminderAt === null ? 0 : Date.parse(state.lastRotateReminderAt);
+    return Math.max(Number.isFinite(fromFile) ? fromFile : 0, lastRotateReminderMs);
+  }
+
+  /**
+   * 追加一行时钟；写失败（目录、权限、格式化器缺失）静默跳过。
+   * 常规行只按 clockIntervalHours 写，换新提醒的标记行由 appendRotateMarkerLine 单独写。
+   */
   function clockTick() {
     const settings = refreshSettings();
     const clockFile = settings.clockFile;
@@ -211,6 +318,27 @@ export function apply(ctx, config) {
       appendFileSync(clockFile, `${parts[0]} ${parts[1]}${suffix}\n`, 'utf8');
     } catch {
       // 时钟写失败不影响会话
+    }
+  }
+
+  /**
+   * 换新提醒到点时额外写的一行：`YYYY-MM-DD HH:mm · 该换会话`，能读到水位时再带
+   * ` 上下文 NN%`（例：`2026-11-18 20:50 · 该换会话 上下文 66%`）。
+   *
+   * 跟常规时钟行是两回事：各自追加、互不覆盖；同一时刻碰巧两行都有也照样并排，不做去重。
+   * 写失败吞掉，不影响注入。
+   */
+  function appendRotateMarkerLine(settings, percent) {
+    const clockFile = settings.clockFile;
+    if (!clockFile) return;
+    const parts = localParts(settings.timeZone);
+    if (parts === null) return;
+    const suffix = percent === null ? '' : ` 上下文 ${percent}%`;
+    try {
+      mkdirSync(dirname(clockFile), { recursive: true });
+      appendFileSync(clockFile, `${parts[0]} ${parts[1]} · 该换会话${suffix}\n`, 'utf8');
+    } catch {
+      // 这一行写不进去也不影响注入
     }
   }
 
@@ -244,11 +372,19 @@ export function apply(ctx, config) {
       // 每次用配置前都热更新一次：设置页保存后，下一轮立刻按新值注入
       const settings = refreshSettings();
 
+      // 范围检查排在最前面：先算范围，再决定要不要做任何事。
+      // 它必须排在读数门限、已提醒档位、换新提醒状态之前——否则范围外的会话会把状态推着走；
+      // 不在范围里就一条都不注入（连读数也不发）。时钟行不经过这里，按间隔照常写。
+      const sessionId = String(agent.session?.header?.id ?? agent.id ?? 'unknown');
+      if (!inScope(settings.scopeSessions, sessionId)) {
+        diag(`skip scope session=${sessionId}`);
+        return decision;
+      }
+
       const watermark = readWatermark(agent.session);
       if (watermark === null) return decision;
       lastPercent = watermark.percent;
 
-      const sessionId = String(agent.session?.header?.id ?? agent.id ?? 'unknown');
       let seen = notified.get(sessionId);
       if (seen === undefined) {
         seen = new Set();
@@ -256,35 +392,58 @@ export function apply(ctx, config) {
       }
 
       const texts = [];
-      // 每轮第一步报一次读数（设置页可以关掉）
+      // 每轮第一步报一次读数（设置页可以关掉；关掉只影响读数，不影响下面的提醒）
       if (settings.injectPerTurn && step === 1) {
         texts.push(
           `上下文水位：${watermark.percent}%（已用 ${fmtTokens(watermark.used)} / 窗口 ${fmtTokens(watermark.window)}）`,
         );
       }
-      // 跨过新阈值时不管第几步都额外说一次，每个阈值每会话只说一次
-      for (const threshold of settings.thresholds) {
-        if (watermark.percent >= threshold && !seen.has(threshold)) {
-          seen.add(threshold);
-          texts.push(`已跨过 ${threshold}%：${adviceFor(threshold)}`);
+      // 跨过新的一档时不管第几步都额外说一次，每档每会话只说一次
+      for (const reminder of REMINDERS) {
+        const threshold = settings[reminder.percentKey];
+        if (watermark.percent >= threshold && !seen.has(reminder.key)) {
+          seen.add(reminder.key);
+          texts.push(reminder.text(watermark.percent));
         }
       }
+      // 换新提醒：每次 pre-step 都查（不限第几步）。周期三选一（interval / weekly / monthly），
+      // 「周几 / 几号」按 timeZone 算本地日期；从未提醒过就立刻提醒。
+      // 到点就注入一次并落状态；关机期间错过的那次，下次打开的第一轮补上，而且只补一次。
+      // 会话范围已在上面的全局 scopeSessions 检查里处理，走到这里就一定在范围内。
+      const lastMs = lastRotateMs();
+      if (isRotateDue(Date.now(), lastMs === 0 ? null : lastMs, settings, settings.timeZone)) {
+        lastRotateReminderMs = Date.now();
+        texts.push(
+          `本周换会话提醒：这一场已经用了 ${watermark.percent}%（窗口 ${fmtTokens(watermark.window)}）。` +
+            '要换就说一声，我按 `tools/rotate-qq-session.mjs` 走——先写交接，再改绑定，最后重启。',
+        );
+        // 顺带在时钟文件里留一行标记；写失败只吞掉，不影响上面的注入
+        appendRotateMarkerLine(settings, watermark.percent);
+        // 写失败不重试到爆：内存里的时间已经挡住本进程的重复提醒，重启后再说
+        stateStore.write({ lastRotateReminderAt: new Date(lastRotateReminderMs).toISOString() });
+      }
       if (texts.length === 0) return decision;
+      // 带上会话 id：日志里没有它就没法判断某条注入属于哪个会话（范围限定时尤其重要）
+      diag(`inject session=${sessionId} step=${step} texts=${JSON.stringify(texts)}`);
 
       return {
         ...decision,
         messages: [
           ...decision.messages,
-          ...texts.map((text) =>
-            createUserMessage({
-              content: [{ type: 'text', text }],
-              source: {
-                kind: name,
-                form: 'snapshot',
-                sections: [{ name, text }],
-              },
-            }),
-          ),
+          ...texts.map((text) => ({
+            // data.id 必须写：宿主校验要求每条 user/message 都能对上一个带 id 的消息，
+            // 缺了它会在会话重新加载时报 "lacks an identified message" 并判定 corrupt。
+            // 2026-11-18 事故：手写字面量替代 createUserMessage 时漏了这个字段，
+            // 攒了 31 条之后会话加载失败。别再省。
+            id: randomUUID(),
+            role: 'user',
+            content: [{ type: 'text', text }],
+            source: {
+              kind: name,
+              form: 'snapshot',
+              sections: [{ name, text }],
+            },
+          })),
         ],
       };
     },
@@ -334,40 +493,6 @@ export function apply(ctx, config) {
     return origin === `http://${req.headers.host || ''}`;
   };
 
-  /* ─────────────── QQ 群会话换新（改 qqbot 的 model-prefs.json） ─────────────── */
-
-  /** qqbot 的绑定文件与换新审计日志；路径来自 lib/bindings.js（基于 os.homedir）。 */
-  const qqbotPrefsFile = prefsPath();
-  const rotationLogFile = rotationsPath();
-
-  /** 读 prefs：文件不存在、坏 JSON、顶层不是对象都返回 null（调用方自己决定怎么报）。 */
-  function readPrefs() {
-    try {
-      const parsed = JSON.parse(readFileSync(qqbotPrefsFile, 'utf8'));
-      return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-    } catch {
-      return null;
-    }
-  }
-
-  /** 备份文件名里的本地时间戳：yyyyMMdd-HHmmss。 */
-  function backupStamp(date) {
-    const pad = (value) => String(value).padStart(2, '0');
-    return (
-      `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}` +
-      `-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
-    );
-  }
-
-  /** 生成一个还没被占用的备份路径；同一秒里连点两次也不会覆盖上一份备份。 */
-  function nextBackupPath(stamp) {
-    const base = `${qqbotPrefsFile}.bak-${stamp}`;
-    if (!existsSync(base)) return base;
-    let counter = 1;
-    while (existsSync(`${base}-${counter}`)) counter += 1;
-    return `${base}-${counter}`;
-  }
-
   const handle = async (req, res, url) => {
     const path = url.pathname;
 
@@ -408,133 +533,6 @@ export function apply(ctx, config) {
       stamp = 'missing';
       syncClockTimer();
       return sendJson(res, 200, { ok: true });
-    }
-
-    /* ── QQ 群会话绑定：列出 ── */
-
-    if (req.method === 'GET' && path === '/api/aux/bindings') {
-      // 文件不存在 / 读坏不报错：设置页显示「没有找到」，不拿一个坏档案吓人
-      return sendJson(res, 200, { ok: true, bindings: listBindings(readPrefs()) });
-    }
-
-    /* ── QQ 群会话绑定：换新（一条） ── */
-
-    if (req.method === 'POST' && path === '/api/aux/rotate') {
-      const body = await readBody(req);
-      const sessionKey = typeof body?.sessionKey === 'string' ? body.sessionKey : '';
-
-      if (parseSessionKey(sessionKey) === null) {
-        return sendJson(res, 400, {
-          ok: false,
-          error: 'sessionKey 不合法：必须形如 qqbot:<appId>:<kind>:<peerId>',
-        });
-      }
-
-      const prefs = readPrefs();
-      if (prefs === null) {
-        return sendJson(res, 400, {
-          ok: false,
-          error: `读不到 ${qqbotPrefsFile}：文件不存在或不是合法 JSON`,
-        });
-      }
-
-      const binding = listBindings(prefs).find((item) => item.sessionKey === sessionKey);
-      if (binding === undefined) {
-        return sendJson(res, 400, {
-          ok: false,
-          error: '这个 sessionKey 不在 model-prefs.json 的 QQ 绑定里',
-        });
-      }
-
-      const newSessionId = mintSessionId();
-      const nextPrefs = rotateBinding(prefs, sessionKey, newSessionId);
-      if (nextPrefs === null) {
-        // prefs 刚被并发改掉、这条刚消失的情况：不写半份文件
-        return sendJson(res, 409, { ok: false, error: '这条绑定在读取之后消失了，请刷新后重试' });
-      }
-
-      const at = new Date();
-      const atText = at.toISOString();
-
-      // 写之前先备份：备份失败就不动原文件（宁可换不成，也不留无法回滚的改动）
-      const backup = nextBackupPath(backupStamp(at));
-      try {
-        copyFileSync(qqbotPrefsFile, backup);
-      } catch (err) {
-        return sendJson(res, 500, {
-          ok: false,
-          error: `备份失败，没有改动 model-prefs.json：${String(err?.message ?? err)}`,
-        });
-      }
-
-      // 原子写回：先写同目录 .tmp 再 rename，崩溃不留半份 JSON
-      const tmpPath = `${qqbotPrefsFile}.tmp`;
-      try {
-        mkdirSync(dirname(qqbotPrefsFile), { recursive: true });
-        writeFileSync(tmpPath, `${JSON.stringify(nextPrefs, null, 2)}\n`, 'utf8');
-        renameSync(tmpPath, qqbotPrefsFile);
-      } catch (err) {
-        try {
-          unlinkSync(tmpPath);
-        } catch {
-          // 临时代可能不存在，删不掉就算了
-        }
-        return sendJson(res, 500, {
-          ok: false,
-          error: `写回 model-prefs.json 失败（备份留在 ${backup}）：${String(err?.message ?? err)}`,
-        });
-      }
-
-      // 审计日志写失败不影响换新本身，只留一句告警
-      try {
-        mkdirSync(dirname(rotationLogFile), { recursive: true });
-        appendFileSync(
-          rotationLogFile,
-          `${JSON.stringify({
-            at: atText,
-            sessionKey,
-            oldSessionId: binding.sessionId,
-            newSessionId,
-          })}\n`,
-          'utf8',
-        );
-      } catch (err) {
-        console.warn(`[aux] 换新记录没写进 ${rotationLogFile}：${String(err?.message ?? err)}`);
-      }
-
-      return sendJson(res, 200, {
-        ok: true,
-        sessionKey,
-        oldSessionId: binding.sessionId,
-        newSessionId,
-        at: atText,
-      });
-    }
-
-    /* ── QQ 群会话绑定：换新记录（最近 20 条） ── */
-
-    if (req.method === 'GET' && path === '/api/aux/rotations') {
-      let lines = [];
-      try {
-        lines = readFileSync(rotationLogFile, 'utf8')
-          .split(/\r?\n/)
-          .filter((line) => line.trim() !== '');
-      } catch {
-        // 文件还不存在 = 还没换过，就是空列表
-        lines = [];
-      }
-      const rotations = [];
-      for (const line of lines.slice(-20)) {
-        try {
-          const value = JSON.parse(line);
-          if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
-            rotations.push(value);
-          }
-        } catch {
-          // 半截行 / 手写坏行跳过，不因为一行坏数据让整个接口失败
-        }
-      }
-      return sendJson(res, 200, { ok: true, rotations });
     }
 
     return sendJson(res, 404, { ok: false, error: `未知接口：${req.method} ${path}` });

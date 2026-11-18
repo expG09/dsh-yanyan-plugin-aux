@@ -16,13 +16,16 @@
  *       () => h(Panel),
  *     ))
  *
- * 页面里的四项配置全部走宿主的 /api/aux：GET 取、POST 存、POST /reset 恢复默认。
+ * 页面里的配置全部走宿主的 /api/aux：GET 取、POST 存、POST /reset 恢复默认。
  * 保存后宿主会立刻热更新，不用重启 DSH。
  *
- * 最下面还有一节「QQ 群会话换新」：GET /api/aux/bindings 列绑定，
- * POST /api/aux/rotate 把某一条的 sessionId 换成新铸的（宿主负责备份与原子写回）。
- * 这一节只改 qqbot 的 model-prefs.json，不动网页/手机这边的会话；qqbot 只在启动时
- * 读这个文件，所以界面提示「重启桌面端后生效」。
+ * 具名项：生效范围（会话限定，管所有注入）、时钟间隔、提醒交接、即将折叠、即将用完、
+ * 换会话提醒周期（三选一，选中哪个就只显示对应那个输入）。每项下面都有一行小字，说清
+ * 「管什么、范围多少、什么时候生效」。
+ * 「生效范围」放在最上面，因为它是**全局**的：留空 = 所有会话都收到读数与提醒，非空就只在
+ * 匹配的会话里注入（时钟行不受影响）。
+ * 三档百分比必须递增（提醒交接 < 即将折叠 < 即将用完）：保存前在本页先拦一道，
+ * 不递增就就地报错、不发请求；宿主那边 normalizeSettings 还会再修一道。
  * ============================================================================
  */
 window.__ModuleLoader__.load({
@@ -33,9 +36,27 @@ window.__ModuleLoader__.load({
 
     const API = '/api/aux'
 
+    /** 换新提醒的三种周期模式；顺序就是下拉里的顺序。 */
+    const MODES = [
+      { value: 'interval', label: '按间隔（每 N 天）' },
+      { value: 'weekly', label: '每周（星期几）' },
+      { value: 'monthly', label: '每月（几号）' },
+    ]
+
+    /** 星期几：0 = 周日 … 6 = 周六，按中国人的习惯从周一排到周日。 */
+    const WEEKDAYS = [
+      { value: '1', label: '周一' },
+      { value: '2', label: '周二' },
+      { value: '3', label: '周三' },
+      { value: '4', label: '周四' },
+      { value: '5', label: '周五' },
+      { value: '6', label: '周六' },
+      { value: '0', label: '周日' },
+    ]
+
     /* ⚠️ 不看 res.ok 的话，HTTP 500 的 { ok:false, error } 会被当成“已保存”。
-       失败时优先把宿主给的 error 原文带出来，方便看出是“sessionKey 不在文件里”
-       这类具体原因，而不是只有一句 HTTP 400。 */
+       失败时优先把宿主给的 error 原文带出来，方便看出是校验没过还是磁盘写不了，
+       而不是只有一句 HTTP 400。 */
     const asJson = async (res) => {
       if (res.ok) return res.json()
       let detail = ''
@@ -86,6 +107,17 @@ window.__ModuleLoader__.load({
         fontFamily: 'inherit',
         outline: 'none',
       },
+      select: {
+        padding: '6px 8px',
+        borderRadius: 6,
+        border: '1px solid var(--dsw-alias-border-weak, rgba(128,128,128,.4))',
+        background: 'transparent',
+        color: 'inherit',
+        fontSize: 13,
+        fontFamily: 'inherit',
+        outline: 'none',
+        minWidth: 180,
+      },
       hint: { fontSize: 12, lineHeight: '18px', color: 'inherit', opacity: 0.7 },
       error: { fontSize: 12, lineHeight: '18px', color: '#e5484d' },
       ok: { fontSize: 12, lineHeight: '18px', color: 'inherit', opacity: 0.75 },
@@ -117,56 +149,85 @@ window.__ModuleLoader__.load({
         cursor: disabled ? 'default' : 'pointer',
         opacity: disabled ? 0.5 : 1,
       }),
-      /* QQ 群会话换新那一节 */
-      section: {
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 8,
-        paddingTop: 14,
-        borderTop: '1px solid var(--dsw-alias-border-weak, rgba(128,128,128,.25))',
-      },
-      sectionTitle: { fontSize: 13, fontWeight: 600 },
-      warn: { fontSize: 12, lineHeight: '18px', color: 'inherit', opacity: 0.85 },
-      qqRow: {
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 4,
-        padding: '6px 0',
-        borderTop: '1px solid var(--dsw-alias-border-weak, rgba(128,128,128,.12))',
-      },
-      qqHead: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
-      qqIds: {
-        display: 'flex',
-        alignItems: 'center',
-        gap: 6,
-        flexWrap: 'wrap',
-        fontFamily: 'ui-monospace, monospace',
-        fontSize: 12,
-      },
       mono: { fontFamily: 'ui-monospace, monospace' },
     }
 
-    /** 宿主的设置对象 → 页面里的草稿（数字和阈值都先变成字符串）。 */
+    /**
+     * 宿主的设置对象 → 页面里的草稿。
+     * 数字统一先变成字符串，方便输入框里编辑到半截（比如清空重打）也不跳；
+     * 会话范围用逗号拼成一行。
+     */
     const toDraft = (settings) => ({
+      scopeSessions: Array.isArray(settings.scopeSessions) ? settings.scopeSessions.join(',') : '',
       clockIntervalHours: String(settings.clockIntervalHours ?? 6),
-      thresholds: Array.isArray(settings.thresholds) ? settings.thresholds.join(',') : '',
-      injectPerTurn: settings.injectPerTurn !== false,
       clockFile: String(settings.clockFile ?? ''),
+      injectPerTurn: settings.injectPerTurn !== false,
+      handoverPercent: String(settings.handoverPercent ?? 50),
+      compactSoonPercent: String(settings.compactSoonPercent ?? 75),
+      nearlyFullPercent: String(settings.nearlyFullPercent ?? 90),
+      rotateReminderMode: MODES.some((item) => item.value === settings.rotateReminderMode)
+        ? settings.rotateReminderMode
+        : 'weekly',
+      rotateReminderDays: String(settings.rotateReminderDays ?? 7),
+      rotateReminderWeekday: String(settings.rotateReminderWeekday ?? 6),
+      rotateReminderDayOfMonth: String(settings.rotateReminderDayOfMonth ?? 1),
     })
 
-    /** 逗号分隔的阈值文本 → 数字数组；真正合法化由宿主 normalizeSettings 做。 */
-    const parseThresholds = (text) => String(text || '')
-      .split(/[,，、\s]+/)
-      .map((piece) => Number(piece))
-      .filter((value) => Number.isFinite(value))
+    /** 文本 → 数字；空串 / 非数字返回 null（交给校验按“填错了”处理）。 */
+    const numOf = (text) => {
+      const trimmed = String(text ?? '').trim()
+      if (trimmed === '') return null
+      const value = Number(trimmed)
+      return Number.isFinite(value) ? value : null
+    }
 
-    /** 普通的一行字段：标题 + 控件 + 说明。 */
+    /**
+     * 逗号分隔的生效范围 → 去空白、去空串、去重的数组。
+     * 真正合法化由宿主 normalizeSettings 做；这里只把输入整理干净。
+     */
+    const parseSessionList = (text) => {
+      const seen = new Set()
+      for (const piece of String(text ?? '').split(/[,，、\s]+/)) {
+        const trimmed = piece.trim()
+        if (trimmed !== '') seen.add(trimmed)
+      }
+      return [...seen]
+    }
+
+    /** 普通的一行字段：标题 + 控件 + 说明。说明统一是一行灰色小字。 */
     function Field({ title, note, children }) {
       return h('div', { style: S.field },
         h('div', { style: S.label }, title),
         children,
         note ? h('div', { style: S.note }, note) : null,
       )
+    }
+
+    /** 数字输入框 + 「单位」提示，各个数字项共用这一个形状。 */
+    function NumberRow({ value, disabled, min, max, step, unit, onChange }) {
+      return h('div', { style: S.row },
+        h('input', {
+          type: 'number',
+          min,
+          max,
+          step,
+          value,
+          disabled,
+          onChange: (e) => onChange(e.target.value),
+          style: { ...S.input, width: 120 },
+        }),
+        unit ? h('span', { style: S.hint }, unit) : null)
+    }
+
+    /** 下拉框；换新提醒的周期和「星期几」都用它。 */
+    function SelectRow({ value, disabled, options, onChange }) {
+      return h('div', { style: S.row },
+        h('select', {
+          value,
+          disabled,
+          onChange: (e) => onChange(e.target.value),
+          style: S.select,
+        }, options.map((item) => h('option', { key: item.value, value: item.value }, item.label))))
     }
 
     function Panel() {
@@ -215,8 +276,8 @@ window.__ModuleLoader__.load({
         setError('')
         setStatus('')
 
-        const hours = Number(draft.clockIntervalHours)
-        if (!Number.isFinite(hours) || hours < 1 || hours > 168) {
+        const hours = numOf(draft.clockIntervalHours)
+        if (hours === null || hours < 1 || hours > 168) {
           setError('时钟间隔必须是 1–168 之间的数字')
           return
         }
@@ -226,17 +287,71 @@ window.__ModuleLoader__.load({
           return
         }
 
+        const handover = numOf(draft.handoverPercent)
+        const compactSoon = numOf(draft.compactSoonPercent)
+        const nearlyFull = numOf(draft.nearlyFullPercent)
+        for (const [value, name] of [
+          [handover, '提醒交接'],
+          [compactSoon, '即将折叠'],
+          [nearlyFull, '即将用完'],
+        ]) {
+          if (value === null || !Number.isInteger(value) || value < 1 || value > 100) {
+            setError(name + '必须是 1–100 之间的整数')
+            return
+          }
+        }
+        // 三档必须严格递增：不递增就地拦下，不发请求（后端还有一道排序修正）
+        if (!(handover < compactSoon && compactSoon < nearlyFull)) {
+          setError('三档百分比必须递增：提醒交接 < 即将折叠 < 即将用完')
+          return
+        }
+
+        // 换新提醒的周期：只校验当前模式对应的那个输入，另外两个按默认兜底发过去
+        const mode = draft.rotateReminderMode
+        if (!MODES.some((item) => item.value === mode)) {
+          setError('换会话提醒周期只能是按间隔 / 每周 / 每月')
+          return
+        }
+        const days = numOf(draft.rotateReminderDays)
+        const weekday = numOf(draft.rotateReminderWeekday)
+        const dayOfMonth = numOf(draft.rotateReminderDayOfMonth)
+        if (mode === 'interval') {
+          if (days === null || !Number.isInteger(days) || days < 1 || days > 365) {
+            setError('「每 N 天」必须是 1–365 之间的整数')
+            return
+          }
+        } else if (mode === 'weekly') {
+          if (weekday === null || !Number.isInteger(weekday) || weekday < 0 || weekday > 6) {
+            setError('「星期几」必须是周一…周日之一')
+            return
+          }
+        } else if (dayOfMonth === null || !Number.isInteger(dayOfMonth) || dayOfMonth < 1 || dayOfMonth > 28) {
+          setError('「每月几号」必须是 1–28 之间的整数')
+          return
+        }
+
         setSaving('save')
         try {
           const r = await jpost('/settings', {
             clockFile,
             clockIntervalHours: hours,
             injectPerTurn: draft.injectPerTurn,
-            thresholds: parseThresholds(draft.thresholds),
+            handoverPercent: handover,
+            compactSoonPercent: compactSoon,
+            nearlyFullPercent: nearlyFull,
+            rotateReminderMode: mode,
+            rotateReminderDays: Number.isInteger(days) && days >= 1 && days <= 365 ? days : 7,
+            rotateReminderWeekday:
+              Number.isInteger(weekday) && weekday >= 0 && weekday <= 6 ? weekday : 6,
+            rotateReminderDayOfMonth:
+              Number.isInteger(dayOfMonth) && dayOfMonth >= 1 && dayOfMonth <= 28
+                ? dayOfMonth
+                : 1,
+            scopeSessions: parseSessionList(draft.scopeSessions),
           })
           if (!alive.current) return
           applyServer(r)
-          setStatus('已保存 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false }))
+          setStatus('已保存 ' + new Date().toLocaleString('zh-CN', { hour12: false }))
         } catch (err) {
           if (alive.current) setError('保存失败：' + String(err?.message ?? err))
         } finally {
@@ -285,43 +400,93 @@ window.__ModuleLoader__.load({
 
       const disabled = saving !== ''
 
+      // 周期模式：只显示当前选中的那个输入
+      let modeInput = null
+      if (draft.rotateReminderMode === 'interval') {
+        modeInput = h(Field, {
+          title: '每 N 天提醒一次',
+          note: '按间隔模式：距上次提醒满 N 天就提醒一次。范围 1–365 的整数。保存后立即生效。',
+        },
+          h(NumberRow, {
+            value: draft.rotateReminderDays,
+            disabled,
+            min: 1,
+            max: 365,
+            step: 1,
+            unit: '天',
+            onChange: (value) => setDraft({ ...draft, rotateReminderDays: value }),
+          }))
+      } else if (draft.rotateReminderMode === 'weekly') {
+        modeInput = h(Field, {
+          title: '每周几提醒',
+          note: '每周模式：上次提醒之后最近的这个星期几到了就提醒（按配置的时区算本地日期）。保存后立即生效。',
+        },
+          h(SelectRow, {
+            value: draft.rotateReminderWeekday,
+            disabled,
+            options: WEEKDAYS,
+            onChange: (value) => setDraft({ ...draft, rotateReminderWeekday: value }),
+          }))
+      } else {
+        modeInput = h(Field, {
+          title: '每月几号提醒',
+          note: '每月模式：上次提醒之后最近的这个日期到了就提醒（按配置的时区算本地日期）。范围 1–28 的整数，每月都有。保存后立即生效。',
+        },
+          h(NumberRow, {
+            value: draft.rotateReminderDayOfMonth,
+            disabled,
+            min: 1,
+            max: 28,
+            step: 1,
+            unit: '号',
+            onChange: (value) => setDraft({ ...draft, rotateReminderDayOfMonth: value }),
+          }))
+      }
+
       return h('div', { style: S.page },
         h(Field, {
-          title: '时钟间隔',
-          note: h('span', null,
-            '写一行 ',
-            h('code', { style: { fontFamily: 'ui-monospace, monospace' } }, 'YYYY-MM-DD HH:mm'),
-            '，进程启动时先补一行。'),
-        },
-          h('div', { style: S.row },
-            h('input', {
-              type: 'number',
-              min: 1,
-              max: 168,
-              step: 1,
-              value: draft.clockIntervalHours,
-              disabled,
-              onChange: (e) => setDraft({ ...draft, clockIntervalHours: e.target.value }),
-              style: { ...S.input, width: 120 },
-            }),
-            h('span', { style: S.hint }, '小时（1–168）'))),
-
-        h(Field, {
-          title: '提醒阈值',
-          note: '同一会话每个阈值只提醒一次。',
+          title: '生效范围',
+          note: '留空 = 所有会话都收到读数与提醒；填会话 id（或前缀）就只在那些会话里注入。时钟行不受影响。',
         },
           h('input', {
             type: 'text',
-            value: draft.thresholds,
+            value: draft.scopeSessions,
             disabled,
-            placeholder: '50,70',
-            onChange: (e) => setDraft({ ...draft, thresholds: e.target.value }),
-            style: S.input,
+            placeholder: '留空 = 所有会话，例如 session-3df4e987',
+            onChange: (e) => setDraft({ ...draft, scopeSessions: e.target.value }),
+            style: { ...S.input, fontFamily: 'ui-monospace, monospace' },
+          })),
+
+        h(Field, {
+          title: '时钟间隔',
+          note: '每几小时往时钟文件续一行（进程启动时先补一行）。范围 1–168，可填小数。保存后立即生效，下一拍按新间隔写。',
+        },
+          h(NumberRow, {
+            value: draft.clockIntervalHours,
+            disabled,
+            min: 1,
+            max: 168,
+            step: 1,
+            unit: '小时',
+            onChange: (value) => setDraft({ ...draft, clockIntervalHours: value }),
+          })),
+
+        h(Field, {
+          title: '时钟文件',
+          note: '时钟行写到哪个文件，只认绝对路径，父目录不存在会自动建。保存后立即生效。',
+        },
+          h('input', {
+            type: 'text',
+            value: draft.clockFile,
+            disabled,
+            placeholder: 'G:\\...\\clock.md',
+            onChange: (e) => setDraft({ ...draft, clockFile: e.target.value }),
+            style: { ...S.input, fontFamily: 'ui-monospace, monospace' },
           })),
 
         h(Field, {
           title: '每轮注入',
-          note: '关掉后只在跨阈值时提醒。',
+          note: '每个 turn 的第一步是否注入一条水位读数；关掉后只剩三档提醒和换会话提醒。保存后立即生效。',
         },
           h('div', { style: S.row },
             h('button', {
@@ -333,21 +498,63 @@ window.__ModuleLoader__.load({
               style: S.switchButton(draft.injectPerTurn, disabled),
             }, draft.injectPerTurn ? '已开启' : '已关闭'),
             h('span', { style: S.hint }, draft.injectPerTurn
-              ? '每个 turn 的第一步注入一条水位读数'
-              : '不每轮注入，只在跨阈值时提醒'))),
+              ? '每轮第一步报一条读数'
+              : '不报读数，只留提醒'))),
 
         h(Field, {
-          title: '时钟文件',
-          note: '绝对路径，父目录会自建。',
+          title: '提醒交接（%）',
+          note: '到这条线提醒把中间结论落盘。范围 1–100 的整数，须小于「即将折叠」。保存后立即生效。',
         },
-          h('input', {
-            type: 'text',
-            value: draft.clockFile,
+          h(NumberRow, {
+            value: draft.handoverPercent,
             disabled,
-            placeholder: 'G:\\...\\clock.md',
-            onChange: (e) => setDraft({ ...draft, clockFile: e.target.value }),
-            style: { ...S.input, fontFamily: 'ui-monospace, monospace' },
+            min: 1,
+            max: 100,
+            step: 1,
+            unit: '%',
+            onChange: (value) => setDraft({ ...draft, handoverPercent: value }),
           })),
+
+        h(Field, {
+          title: '即将折叠（%）',
+          note: '到这条线提醒快要折叠了；折叠只留摘要、细节会丢。范围 1–100 的整数，须大于「提醒交接」、小于「即将用完」。保存后立即生效。',
+        },
+          h(NumberRow, {
+            value: draft.compactSoonPercent,
+            disabled,
+            min: 1,
+            max: 100,
+            step: 1,
+            unit: '%',
+            onChange: (value) => setDraft({ ...draft, compactSoonPercent: value }),
+          })),
+
+        h(Field, {
+          title: '即将用完（%）',
+          note: '到这条线提醒该换新会话了。范围 1–100 的整数，须大于「即将折叠」。保存后立即生效。',
+        },
+          h(NumberRow, {
+            value: draft.nearlyFullPercent,
+            disabled,
+            min: 1,
+            max: 100,
+            step: 1,
+            unit: '%',
+            onChange: (value) => setDraft({ ...draft, nearlyFullPercent: value }),
+          })),
+
+        h(Field, {
+          title: '换会话提醒周期',
+          note: '多久提醒一次换会话：按间隔（每 N 天）/ 每周（星期几）/ 每月（几号）。保存后立即生效。',
+        },
+          h(SelectRow, {
+            value: draft.rotateReminderMode,
+            disabled,
+            options: MODES,
+            onChange: (value) => setDraft({ ...draft, rotateReminderMode: value }),
+          })),
+
+        modeInput,
 
         h('div', { style: S.footer },
           h('div', { style: S.row },
@@ -364,125 +571,7 @@ window.__ModuleLoader__.load({
               style: S.button(false, disabled),
             }, saving === 'reset' ? '恢复中…' : '恢复默认'),
             status ? h('span', { style: S.ok }, status) : null),
-          error ? h('div', { style: S.error }, error) : null),
-
-        // 现有四项配置下面：QQ 群会话换新（独立于上面这份设置文件）
-        h(QqRotate))
-    }
-
-    /* ─────────────── QQ 群会话换新 ─────────────── */
-
-    /** 取末尾 8 位给页面看；完整值放在 title 里悬停可见。 */
-    const tail8 = (value) => {
-      const text = String(value ?? '')
-      return text.length > 8 ? text.slice(-8) : text
-    }
-
-    /** 一节「QQ 群会话换新」：列绑定、逐条换新。只影响 QQ 群聊，不动别的会话。 */
-    function QqRotate() {
-      const [bindings, setBindings] = React.useState(null) // null = 还没读到
-      const [error, setError] = React.useState('')
-      const [rotating, setRotating] = React.useState('') // 正在换新的 sessionKey
-      const [done, setDone] = React.useState({}) // sessionKey → { oldId, newId }
-      const [rowError, setRowError] = React.useState({}) // sessionKey → 错误文本
-      const alive = React.useRef(true)
-
-      React.useEffect(() => () => {
-        alive.current = false
-      }, [])
-
-      const load = React.useCallback(() => {
-        setError('')
-        jget('/bindings')
-          .then((r) => {
-            if (!alive.current) return
-            setBindings(Array.isArray(r?.bindings) ? r.bindings : [])
-          })
-          .catch((err) => {
-            if (!alive.current) return
-            setError('读取 QQ 群会话绑定失败：' + String(err?.message ?? err))
-            setBindings(null)
-          })
-      }, [])
-
-      React.useEffect(() => {
-        load()
-      }, [load])
-
-      const rotate = async (sessionKey) => {
-        if (rotating) return
-        setRotating(sessionKey)
-        setRowError((prev) => ({ ...prev, [sessionKey]: '' }))
-        try {
-          const r = await jpost('/rotate', { sessionKey })
-          if (!alive.current) return
-          if (r?.ok !== true) throw new Error(r?.error || '宿主没有返回 ok')
-          setDone((prev) => ({
-            ...prev,
-            [sessionKey]: { oldId: r.oldSessionId, newId: r.newSessionId },
-          }))
-          // 行内显示的 sessionId 跟着改成新的
-          setBindings((prev) => (Array.isArray(prev)
-            ? prev.map((item) => (item.sessionKey === sessionKey
-              ? { ...item, sessionId: r.newSessionId }
-              : item))
-            : prev))
-        } catch (err) {
-          if (alive.current) {
-            setRowError((prev) => ({
-              ...prev,
-              [sessionKey]: '换新失败：' + String(err?.message ?? err),
-            }))
-          }
-        } finally {
-          if (alive.current) setRotating('')
-        }
-      }
-
-      const body = []
-      if (error) {
-        body.push(h('div', { style: S.error }, error))
-        body.push(h('div', { style: S.row },
-          h('button', { type: 'button', style: S.button(false, false), onClick: load }, '重试')))
-      } else if (bindings === null) {
-        body.push(h('div', { style: S.hint }, '读取 QQ 群会话绑定中…'))
-      } else if (bindings.length === 0) {
-        body.push(h('div', { style: S.hint }, '没有找到 QQ 群会话绑定'))
-      } else {
-        for (const item of bindings) {
-          const result = done[item.sessionKey]
-          body.push(h('div', { key: item.sessionKey, style: S.qqRow },
-            h('div', { style: S.qqHead },
-              h('div', { style: S.qqIds },
-                h('span', { title: '会话类型' }, item.kind),
-                h('span', { title: item.peerId }, tail8(item.peerId)),
-                h('span', null, '·'),
-                h('span', { title: item.sessionId }, tail8(item.sessionId))),
-              h('button', {
-                type: 'button',
-                disabled: rotating === item.sessionKey,
-                onClick: () => rotate(item.sessionKey),
-                style: S.button(false, rotating === item.sessionKey),
-              }, rotating === item.sessionKey ? '换新中…' : '换新')),
-            result
-              ? h('div', { style: S.ok }, '已换新：旧 ' + tail8(result.oldId) + ' → 新 ' + tail8(result.newId))
-              : null,
-            result
-              ? h('div', { style: S.note }, '重启桌面端后生效（从托盘退出再打开，新会话才接上）。' +
-                'qqbot 把会话绑定缓存在内存里，重启才会重读文件。')
-              : null,
-            rowError[item.sessionKey]
-              ? h('div', { style: S.error }, rowError[item.sessionKey])
-              : null))
-        }
-      }
-
-      return h('div', { style: S.section },
-        h('div', { style: S.sectionTitle }, 'QQ 群会话换新'),
-        h('div', { style: S.note },
-          '只影响 QQ 群聊里的会话；网页和手机这边的会话不受影响，要换请在界面上新开会话。'),
-        h('div', { style: S.warn }, '换新前建议先让助手写一份交接。'),
-        ...body)
+          error ? h('div', { style: S.error }, error) : null))
     }
 
     return {

@@ -4,70 +4,104 @@
 
 - **每轮读数**：每个 turn 的第一步，向模型上下文注入一条「上下文水位」读数，内容形如
   `上下文水位：42%（已用 84K / 窗口 200K）`。读数来自 `ctx.tokenMeter.contextPressure()`，
-  是最近一次请求的 prompt 侧占用，不是本轮内容算出来的。
-- **阈值提醒**：占比第一次跨过 50%、70% 时，各额外注入一条提醒；同一个会话里每个阈值只提醒一次。
-  跑在 turn 的后续步骤里跨过阈值时也会立刻提醒，不等下一轮。
+  是最近一次请求的 prompt 侧占用，不是本轮内容算出来的。`injectPerTurn` 关掉则完全不注入读数行，
+  但下面的三档提醒和换新提醒照常。受全局 `scopeSessions` 限定（见下）。
+- **三档提醒**：占比第一次跨过三档线时，各额外注入一条对应文案，同一会话每档只提醒一次：
+  - 提醒交接（`handoverPercent`，默认 50）：「上下文 X%：该写交接了——长任务先把结论落盘，再往下做。」
+  - 即将折叠（`compactSoonPercent`，默认 75）：「上下文 X%：快到折叠线了。折叠只留摘要，细节会丢；
+    重要结论先落盘。」
+  - 即将用完（`nearlyFullPercent`，默认 90）：「上下文 X%：快满了，该换新会话了。」
+
+  三档文案各说各的事，不合并成一句。跑在 turn 的后续步骤里跨过线时也会立刻提醒，不等下一轮。
 - **时钟行**：每 `clockIntervalHours` 小时往 `clockFile` 追加一行 `YYYY-MM-DD HH:mm`；
   能读到水位时同一行追加 ` 上下文 NN%`。进程启动时先补写一行，之后按间隔写。
-- **QQ 群会话换新**：设置页列出 qqbot 的群会话绑定，点某一行「换新」就把那一条
-  `sessionKey → sessionId` 换成新铸的 `session-<uuid>`。只影响 QQ 群聊；改的是 qqbot 的
-  `%USERPROFILE%\.dsh-qqbot\model-prefs.json`，写前备份、原子写回、记一行审计。
+- **换新提醒**：**每次 pre-step 都检查**（不限第几步）。周期三选一（`rotateReminderMode`）：
+
+  - `interval`：距上次提醒满 `rotateReminderDays` 天（1–365）；
+  - `weekly`：上次提醒之后最近的、落在 `rotateReminderWeekday`（0=周日 … 6=周六）的自然日到了；
+  - `monthly`：上次提醒之后最近的、`rotateReminderDayOfMonth`（1–28）那个自然日到了。
+
+  「周几 / 几号」按 `timeZone` 算本地日期。第一次运行（状态里没有记录）立刻提醒；到点注入一条
+  「该换会话」提醒，写回 `%USERPROFILE%\.dsh\aux-state.json`，同时**另外**往 `clockFile` 追加一行
+  `YYYY-MM-DD HH:mm · 该换会话`，能读到水位时再带 ` 上下文 NN%`
+  （例：`2026-11-18 20:50 · 该换会话 上下文 66%`）。关机期间错过的那次，下次打开的第一轮补上，
+  只补一次。换新动作本身交给外置脚本 `tools/rotate-qq-session.mjs`，插件不碰任何别人的存储。
+- **生效范围（全局）**：`scopeSessions` 为空数组 = 所有会话都收；非空时只有会话 id **等于**
+  某一项、或**以某一项开头**的会话才会收到**任何注入**（读数、三档提醒、换新提醒）。
+  范围检查排在 pre-step 的最前面：不匹配就直接返回，一条都不注入（连读数也不发），
+  也不会推进读数门限、已提醒档位和换新提醒状态。跳过时在 `aux-debug.log` 里写一行
+  `skip scope session=<id>`。**时钟行不受影响**——它按 `clockIntervalHours` 照常写。
 
 ## 怎么配
 
-`cordis.patch.yml` 里的 `config` 是**出厂默认**，五个键都必填：
+⚠️ **入口在「设置」里，不在插件页，也不在左侧主侧边栏。** 点设置 → 左侧导航「砚砚工具包」，那一页才能改。插件页只显示介绍和图标。
+
+`cordis.patch.yml` 里的 `config` 是**出厂默认**，十二项都写全：
 
 | 键 | 类型 | 示例 | 说明 |
 | --- | --- | --- | --- |
+| `scopeSessions` | string[] | `[]` | 全局生效范围。空数组 = 所有会话；非空只在「等于或以其开头」的会话里注入**任何内容**（读数、三档提醒、换新提醒）。去空白、去空串、去重；非数组回落默认。**只管注入，不管时钟**。 |
 | `clockFile` | string | `G:\yanyan-workspace\report-cache\clock.md` | 时钟行追加到哪个文件。目录不存在会自动建。 |
 | `clockIntervalHours` | number | `6` | 时钟行间隔（小时），合法范围 1–168；超出按非法处理，回落到默认。 |
-| `injectPerTurn` | boolean | `true` | 是否每轮第一步注入读数。提醒不受它影响。 |
-| `thresholds` | number[] | `[50, 70]` | 提醒阈值；逐项取整、钳制到 1–100、去重升序。 |
-| `timeZone` | string | `Asia/Shanghai` | 时钟行的时区。无效时回落到进程所在时区。 |
+| `injectPerTurn` | boolean | `true` | 是否每轮第一步注入读数。关掉只影响读数，提醒不受它影响。 |
+| `handoverPercent` | number | `50` | 提醒交接线（%），钳制到 1–100。 |
+| `compactSoonPercent` | number | `75` | 即将折叠线（%），钳制到 1–100。 |
+| `nearlyFullPercent` | number | `90` | 即将用完线（%），钳制到 1–100。 |
+| `rotateReminderMode` | string | `weekly` | 换新提醒周期：`interval` / `weekly` / `monthly`；非法值回落 `weekly`。 |
+| `rotateReminderDays` | number | `7` | 仅 `interval` 模式用：隔几天提醒，钳制到 1–365。 |
+| `rotateReminderWeekday` | number | `6` | 仅 `weekly` 模式用：0 = 周日 … 6 = 周六；越界或非法回落 6。 |
+| `rotateReminderDayOfMonth` | number | `1` | 仅 `monthly` 模式用：每月几号 1–28；越界回落 1。 |
+| `timeZone` | string | `Asia/Shanghai` | 时钟行、以及换新提醒算「周几 / 几号」用的时区。无效时回落到进程所在时区。 |
 
-装好之后在 **设置 → 砚砚工具包** 里改这四项（时区仍走 patch）：保存写入
-`%USERPROFILE%\.dsh\aux-settings.json`，宿主在每次 pre-step 与时钟 tick 前检查文件
-mtime，变了就重读，所以**保存即生效、不用重启**。「恢复默认」删掉设置文件，回到 patch 的值。
-设置文件写坏时保留上一份好配置；文件被删则立刻回到 patch 默认。
+三个百分比是**一条阶梯**，必须严格递增：
 
-## QQ 群会话换新
+- 设置页保存前先校验，不递增就地报错、不提交（前端一道）；
+- `normalizeSettings` 再兜一道：各自取整后钳制到 1–100，按 handover < compactSoon < nearlyFull
+  的顺序排序；排序后仍相等（比如三项都填 90），就从低到高各加 1 撑开
+  （`[90,90,90]` → `[90,91,92]`，`[1,1,1]` → `[1,2,3]`），确保三档仍合法且递增。
 
-设置页现有四项配置下面多了一节「QQ 群会话换新」。它不读写 `aux-settings.json`，改的是
-qqbot 的私有状态：
+装好之后在 **设置 → 砚砚工具包** 里改，保存写入 `%USERPROFILE%\.dsh\aux-settings.json`，宿主在
+每次 pre-step 与时钟 tick 前检查文件 mtime，变了就重读，所以**保存即生效、不用重启**。
+「恢复默认」删掉设置文件，回到 patch 的值。设置文件写坏时保留上一份好配置；文件被删则立刻回到
+patch 默认。
 
-- 绑定文件：`%USERPROFILE%\.dsh-qqbot\model-prefs.json`，一条绑定是 `sessionIds` 里的
-  `qqbot:<appId>:<kind>:<peerId>` → `session-<uuid>`。
-- 换新流程：校验 sessionKey → 生成 `session-<uuid>` → 备份 `model-prefs.json` 到同目录
-  `model-prefs.json.bak-<yyyyMMdd-HHmmss>` → 写 `.tmp` 再 rename 覆盖 → 往
-  `%USERPROFILE%\.dsh\aux-rotations.jsonl` 追加一行 `{ at, sessionKey, oldSessionId, newSessionId }`。
-- 文件里其他键（`overrides`、`presets`、以后新增的）原样保留；备份失败就不写，写失败会
-  保留备份路径并报错。
-- 「QQ 群会话换新」只影响 QQ 群聊里的会话；网页和手机这边的会话不受影响，要换请在界面上新开会话。
-  换新不迁移上下文，旧会话文件还在，只是这个群不再往里写。
-- **重启桌面端后生效**：qqbot 的 `PrefsStore.load()` 只在构造时读一次 `model-prefs.json`，
-  `sessionIds` 之后一直是内存里的 Map，没有 reload、也没有文件 watch。所以外部改文件不会立刻
-  接上新会话；要从托盘退出再打开，qqbot 启动时才重读文件、用新 sessionId 恢复会话。
+## 换新提醒
 
-**风险（跨插件耦合）**：`model-prefs.json` 是 qqbot 的内部实现，不是公开契约。它升级后若改了
-存储格式/位置，插件可能列不出绑定或换新失败；本插件只做最小读写、保留不认识的键、写前备份，
-失败不会清空原文件。另外它自己的 `/new` 命令虽然能立即换会话（内存+文件同时改），但只在私聊
-可用，没有暴露给外部的群会话换新接口——这正是这里直接改文件的原因，也是它必须重启才生效的原因。
+状态与设置分开放：状态在 `%USERPROFILE%\.dsh\aux-state.json`，设置永远只在上面的
+`aux-settings.json`。
+
+- 状态文件只有一个字段：`{ "lastRotateReminderAt": "<ISO 字符串>" }`（或 `null`）。
+- 到点条件：从未提醒过（第一次运行）→ 立刻到期；之后按 `rotateReminderMode`：
+  `interval` 看距上次的天数，`weekly` / `monthly` 看「上次提醒之后最近的周几 / 几号」是否已到。
+  **每次 pre-step 都查，不限第几步**——关机期间错过的那次，下次打开的第一轮就补上，只补一次。
+  到期判断的纯逻辑在 `lib/rotate-schedule.js` 的 `isRotateDue()`，按 `timeZone` 算本地日期。
+- 会话范围：`scopeSessions` 为空数组 = 所有会话；非空时只有会话 id **等于**某一项、
+  或**以某一项开头**的会话才收到任何注入。它是**全局**的，不只作用于换新提醒——
+  范围外的会话连水位读数都收不到，也不会推进任何到期判断的状态。时钟行不受影响。
+- 到点后注入一条：
+  「本周换会话提醒：这一场已经用了 X%（窗口 Y）。要换就说一声，我按 `tools/rotate-qq-session.mjs`
+  走——先写交接，再改绑定，最后重启。」然后把当前时间写回状态文件。
+- 同一次还会**另外**往 `clockFile` 追加一行
+  `YYYY-MM-DD HH:mm · 该换会话`（能读到水位时带 ` 上下文 NN%`）。这行跟常规时钟行是两回事：
+  各自追加、互不覆盖，同一时刻两行都有也并排留着，不做去重；写失败吞掉，不影响注入。
+- 容错：状态文件读不到 / 是坏 JSON / 字段不是字符串，一律当作从没提醒过；写失败吞掉。为了不让写失败
+  变成每个 pre-step 都提醒一次，宿主进程内另记一份上次提醒时间，取两者较晚的那个来判到点。
+
+换新本身**不在插件里**：不读 `model-prefs.json`、不缓存绑定、不铸 session id。按提醒去跑
+`tools/rotate-qq-session.mjs` 即可（先写交接，再改绑定，最后重启桌面端）。
 
 ## 设置页接口
 
 设置页全部走同一个前缀路由 `/api/aux`（`ctx.webServer.register`，`kind: 'prefix'`）。
 `webServer` 不是必需服务：`inject` 里不要它，apply 时用 `ctx.get('webServer')` 探测一次，
 拿不到就在第一次 `agent/pre-step` 再补试一次（只试一次），还拿不到就只跳过这些接口，
-水位与时钟照常跑；挂上后路由仍随 `ctx.effect` 卸载清理。
+水位、提醒与时钟照常跑；挂上后路由仍随 `ctx.effect` 卸载清理。
 
 | 方法 | 路径 | 返回 |
 | --- | --- | --- |
 | GET | `/api/aux/settings` | `{ ok: true, settings, effective }`：`settings` 是文件里的（没有则 `null`），`effective` 是此刻真正生效的 |
 | POST | `/api/aux/settings` | 收 JSON，规整后写文件；成功 `{ ok: true, settings }`，写失败 500 `{ ok: false, error }` |
 | POST | `/api/aux/reset` | 删设置文件、回到 patch 默认，返回 `{ ok: true }` |
-| GET | `/api/aux/bindings` | `{ ok: true, bindings: [{ sessionKey, appId, kind, peerId, sessionId }] }`；文件不存在/坏掉返回空数组，不报错 |
-| POST | `/api/aux/rotate` | 收 `{ sessionKey }`；成功 `{ ok: true, sessionKey, oldSessionId, newSessionId, at }`；sessionKey 不合法或不在文件里 400 `{ ok: false, error }` |
-| GET | `/api/aux/rotations` | `{ ok: true, rotations: [...] }`，`%USERPROFILE%\.dsh\aux-rotations.jsonl` 最近 20 条，坏行跳过 |
 
 请求体读取上限 1MB；超过上限会先把 Promise 收掉再断开连接。`Origin` 头存在时必须等于
 `http://` + `Host`，否则 403。
@@ -76,9 +110,10 @@ qqbot 的私有状态：
 
 - **水位读不到时不注入**：`contextPressure()` 缺 `pressureTokens` 或 `contextWindow`、窗口不为正、
   或调用抛错时，这一轮什么都不注入，也不写水位后缀，只保证会话照常进行。
-- **阈值每会话只提醒一次**：插件进程内按会话 id 记账，进程重启后重新计数；同一个会话不会重复提醒同一个阈值。
-- **时钟行只在进程活着时按间隔写**：进程不在的时段没有记录，启动时只补当下一行，不补历史。
-- **QQ 换新依赖 qqbot 内部文件格式**：它升级后可能改 `model-prefs.json` 的结构；插件只做最小读写、
-  保留未知键、写前备份。绑定缓存在 qqbot 进程内存里，换新后必须重启桌面端才生效。
+- **生效范围按会话 id 前缀匹配**：`scopeSessions` 填错前缀，那个会话就一条注入都收不到；
+  留空（所有会话）最稳。诊断日志里会有 `skip scope session=<id>`。
+- **提醒每会话每档只记一次**：插件进程内按会话 id 记账，进程重启后重新计数。
+- **时钟行只在进程活着时按间隔写**：进程不在的时段没有记录，启动时只补当下一行，不补历史；
+  ` · 该换会话` 那一行只在换新提醒到点的那一次写。
 - **没有 webServer 就只是没接口**：启动与第一次 pre-step 都探测不到 webServer 的 profile 里，
-  设置页与 QQ 换新不可用，水位与时钟不受影响。
+  设置页不可用，水位、提醒与时钟不受影响。
