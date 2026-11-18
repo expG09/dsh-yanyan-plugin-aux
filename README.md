@@ -57,7 +57,7 @@ DeepSeek Harness 的辅助插件包，目前管三件事：
 
 | 功能 | 依赖 | 缺了会怎样 |
 |---|---|---|
-| 水位读数、四档提醒、交接文件 | `agent/pre-step` 事件 + `ctx.tokenMeter.contextPressure(session)`（由 `@deepseek-ai/dsh-token-meter` 提供） | 读不到水位就一条都不注入；四档提醒与交接文件都基于水位，所以也不会触发 |
+| 水位读数、四档提醒、交接文件 | `agent/pre-step` 事件 + `ctx.tokenMeter.contextPressure(session)`（由 `@deepseek-ai/dsh-token-meter` 提供，**这是 DSH 基座自带的，不用另装任何插件**） | 读不到水位就一条都不注入；四档提醒与交接文件都基于水位，所以也不会触发 |
 | 时钟行 | 无（只用 node 的 fs）；按进程定时器写 | 不依赖任何插件 |
 | 换新提醒 | 无（纯时间计算，时区用配置里的 `timeZone`） | 不依赖任何插件，但要该会话发起请求才会注入 |
 | 设置页 | `settings.section` 槽位（`@deepseek-ai/dsh-client-ui-settings`）+ 宿主的 `webServer` 提供 `/api/aux` | 没有 webServer 时面板读不到也存不了，只能改 `cordis.patch.yml` 的出厂默认 |
