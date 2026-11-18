@@ -1,9 +1,9 @@
 {
   "name": "dsh-yanyan-plugin-aux",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
-  "description": "Yanyan helpers for DeepSeek Harness: per-turn context watermark readings (optionally scoped to specific sessions), three tiered reminders, a periodic clock line, and scheduled session-rotation reminders.",
+  "description": "Yanyan helpers for DeepSeek Harness: per-turn context watermark readings (optionally scoped to specific sessions), three tiered reminders, a handover template file at the handover threshold, a periodic clock line, and scheduled session-rotation reminders.",
   "license": "MIT",
   "keywords": [
     "dsh",
@@ -28,7 +28,7 @@
     "./icon": "./icon.svg"
   },
   "scripts": {
-    "test": "node test/settings.test.mjs && node test/rotate-schedule.test.mjs"
+    "test": "node test/settings.test.mjs && node test/rotate-schedule.test.mjs && node test/handover.test.mjs"
   },
   "dsh": {
     "bundle": {

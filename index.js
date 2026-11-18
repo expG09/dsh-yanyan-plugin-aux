@@ -8,6 +8,10 @@
  *        - compactSoonPercent（默认 75）：快到折叠线了；
  *        - nearlyFullPercent（默认 90）：该换新会话了。
  *      三档提醒不受 injectPerTurn 影响，该说照说。
+ *      跨过 handover 这一档时**额外落一份交接模板文件**（只写文件，不塞进注入正文）：
+ *      写在 clockFile 同目录，文件名 `交接-<yyyy-MM-dd>-<会话 id 后 8 位>.md`，
+ *      已存在就不覆盖、不追加，注入里只追加一行指针 `模板已生成：<绝对路径>`。
+ *      compactSoon / nearlyFull 不生成模板；范围外的会话不注入，也就不生成。
  *   2. 按 clockIntervalHours 往 clockFile 追加一行 `YYYY-MM-DD HH:mm`，能读到水位时
  *      追加 ` 上下文 NN%`；进程启动时先补写一行。
  *   3. 换新提醒：**每次 pre-step 都检查**（不限第几步）；周期三选一（`rotateReminderMode`）：
@@ -51,7 +55,8 @@ import {
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { renderTemplate, templateFileName } from './lib/handover.js';
 import { isRotateDue } from './lib/rotate-schedule.js';
 import {
   DEFAULT_SETTINGS,
@@ -342,6 +347,37 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * 到交接水位那一次落一份模板文件，返回可注入的绝对路径；写不出来返回 null。
+   *
+   * - 目录取 `clockFile` 的目录（默认就是 `report-cache\`），不存在会建；
+   * - 文件名 `交接-<yyyy-MM-dd>-<会话 id 后 8 位>.md`，日期按进程本地时区
+   *   （clockFile 的 timeZone 只管时钟行，模板文件名跟着机器本地时间走，够用且不会歧义）；
+   * - **已存在就不覆盖、不追加**：用 `flag: 'wx'` 排他写，EEXIST 当作「之前生成过」，
+   *   照样返回路径 —— 注入里给的是指针，文件在不在比谁写的更重要；
+   * - 任何异常都吞掉，只往诊断日志写一行，绝不影响注入本身。
+   */
+  function ensureHandoverTemplate(settings, sessionId) {
+    const clockFile = settings.clockFile;
+    if (!clockFile) return null;
+    const directory = dirname(clockFile);
+    const now = new Date();
+    const file = resolve(directory, templateFileName(now, sessionId));
+    try {
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(file, renderTemplate(now, sessionId), { encoding: 'utf8', flag: 'wx' });
+      diag(`handover template created=${file}`);
+      return file;
+    } catch (err) {
+      if (err?.code === 'EEXIST') {
+        diag(`handover template exists=${file}`);
+        return file;
+      }
+      diag(`handover template failed=${file} ${String(err?.message ?? err)}`);
+      return null;
+    }
+  }
+
   ctx.effect(() => {
     // 进程起来先补一行：上次关机期间的空白在这里收口
     clockTick();
@@ -398,13 +434,20 @@ export function apply(ctx, config) {
           `上下文水位：${watermark.percent}%（已用 ${fmtTokens(watermark.used)} / 窗口 ${fmtTokens(watermark.window)}）`,
         );
       }
-      // 跨过新的一档时不管第几步都额外说一次，每档每会话只说一次
+      // 跨过新的一档时不管第几步都额外说一次，每档每会话只说一次。
+      // handover 这一档额外落一份模板文件（只写文件），文案里再追加一行指针。
+      // 模板只在 handover 生成；compactSoon / nearlyFull 只提醒，不落文件。
       for (const reminder of REMINDERS) {
         const threshold = settings[reminder.percentKey];
-        if (watermark.percent >= threshold && !seen.has(reminder.key)) {
-          seen.add(reminder.key);
-          texts.push(reminder.text(watermark.percent));
+        if (watermark.percent < threshold || seen.has(reminder.key)) continue;
+        seen.add(reminder.key);
+        let text = reminder.text(watermark.percent);
+        if (reminder.key === 'handover') {
+          const templateFile = ensureHandoverTemplate(settings, sessionId);
+          // 写失败就只是少了这一行：提醒照发，不假装文件已经在了
+          if (templateFile !== null) text += `\n模板已生成：${templateFile}`;
         }
+        texts.push(text);
       }
       // 换新提醒：每次 pre-step 都查（不限第几步）。周期三选一（interval / weekly / monthly），
       // 「周几 / 几号」按 timeZone 算本地日期；从未提醒过就立刻提醒。
