@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Yanyan toolkit",
+    "description": "Adds a context-occupancy reading to the model at the first step of every turn, plus one reminder each time a session crosses 50% or 70%. Each threshold reminds once per session. A periodic clock line (YYYY-MM-DD HH:mm, with the current occupancy when it is readable) is appended to a file every 6 hours by default and once when the process starts. Nothing is injected while occupancy is unavailable.",
+    "detail": "docs/DETAIL.md"
+  }
+}

@@ -1,0 +1,11 @@
+- insert:
+    - id: aux
+      name: 'dsh-yanyan-plugin-aux'
+      config:
+        clockFile: 'G:\yanyan-workspace\report-cache\clock.md'
+        clockIntervalHours: 6
+        injectPerTurn: true
+        thresholds:
+          - 50
+          - 70
+        timeZone: Asia/Shanghai

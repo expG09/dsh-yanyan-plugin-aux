@@ -1,0 +1,57 @@
+{
+  "name": "dsh-yanyan-plugin-aux",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Yanyan helpers for DeepSeek Harness: per-turn context watermark readings, a periodic clock line, and manual QQ group session rotation.",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "context",
+    "token-usage",
+    "clock",
+    "qqbot"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/expG09/dsh-yanyan-plugin-aux.git"
+  },
+  "homepage": "https://github.com/expG09/dsh-yanyan-plugin-aux#readme",
+  "bugs": {
+    "url": "https://github.com/expG09/dsh-yanyan-plugin-aux/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "scripts": {
+    "test": "node test/settings.test.mjs && node test/bindings.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ]
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ]
+}
