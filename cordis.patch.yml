@@ -7,8 +7,12 @@
         clockIntervalHours: 6
         injectPerTurn: true
         handoverPercent: 50
+        handoverTemplateEnabled: true
         compactSoonPercent: 75
+        compactSoonEnabled: true
         nearlyFullPercent: 90
+        nearlyFullEnabled: true
+        ledgerPercent: 50
         rotateReminderMode: weekly
         rotateReminderDays: 7
         rotateReminderWeekday: 6

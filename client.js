@@ -19,12 +19,24 @@
  * 页面里的配置全部走宿主的 /api/aux：GET 取、POST 存、POST /reset 恢复默认。
  * 保存后宿主会立刻热更新，不用重启 DSH。
  *
- * 具名项：生效范围（会话限定，管所有注入）、时钟间隔、提醒交接、即将折叠、即将用完、
- * 换会话提醒周期（三选一，选中哪个就只显示对应那个输入）。每项下面都有一行小字，说清
- * 「管什么、范围多少、什么时候生效」。
+ * 具名项：生效范围（会话限定，管所有注入）、时钟间隔、时钟文件、每轮注入、
+ * 三档百分比的提醒行（提醒交接 / 即将折叠 / 即将用完）与独立的「写长期记忆」档、
+ * 换会话提醒周期（三选一，选中哪个就只显示对应那个输入）。每项下面都有一行小字，
+ * 说清「管什么、范围多少、什么时候生效」。
+ *
+ * 提醒区自上而下四行，每行都是「百分比 + 该档自己的勾」：
+ *     提醒交接（%）   [ 50 ] %   ☑ 写交接（落模板文件）
+ *     即将折叠（%）   [ 75 ] %   ☑ 提醒
+ *     即将用完（%）   [ 90 ] %   ☑ 提醒
+ *     写长期记忆（%） [ 50 ] %   （无勾选，填 0 = 关闭）
+ * 规矩：**百分比填 0 = 关闭这一档**。折叠 / 用完两档的勾管「发不发这条提醒」，不勾与填 0 等效；
+ * 交接档的勾管的是「落不落模板文件」，不勾只是不落盘，交接提醒照发。某档为 0 时它后面的勾
+ * 置灰禁用，并提示「该档已关闭」。写长期记忆是独立一档：不挂在交接档上，只注入那一句、
+ * 不落文件，填 0 就关闭，也没有勾。
  * 「生效范围」放在最上面，因为它是**全局**的：留空 = 所有会话都收到读数与提醒，非空就只在
  * 匹配的会话里注入（时钟行不受影响）。
- * 三档百分比必须递增（提醒交接 < 即将折叠 < 即将用完）：保存前在本页先拦一道，
+ * 递增只对**大于 0** 的三档有要求（提醒交接 < 即将折叠 < 即将用完）；写长期记忆独立，
+ * 不参与递增，可以落在任意位置、也可以和别的档相等。保存前在本页先拦一道，
  * 不递增就就地报错、不发请求；宿主那边 normalizeSettings 还会再修一道。
  * ============================================================================
  */
@@ -119,6 +131,17 @@ window.__ModuleLoader__.load({
         minWidth: 180,
       },
       hint: { fontSize: 12, lineHeight: '18px', color: 'inherit', opacity: 0.7 },
+      check: (disabled) => ({
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 5,
+        fontSize: 12,
+        lineHeight: '18px',
+        color: 'inherit',
+        cursor: disabled ? 'default' : 'pointer',
+        opacity: disabled ? 0.45 : 1,
+        userSelect: 'none',
+      }),
       error: { fontSize: 12, lineHeight: '18px', color: '#e5484d' },
       ok: { fontSize: 12, lineHeight: '18px', color: 'inherit', opacity: 0.75 },
       row: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
@@ -156,15 +179,21 @@ window.__ModuleLoader__.load({
      * 宿主的设置对象 → 页面里的草稿。
      * 数字统一先变成字符串，方便输入框里编辑到半截（比如清空重打）也不跳；
      * 会话范围用逗号拼成一行。
+     * 四个百分比保留 0（0 = 关闭这一档），所以用 `??` 而不是 `||`。
      */
     const toDraft = (settings) => ({
       scopeSessions: Array.isArray(settings.scopeSessions) ? settings.scopeSessions.join(',') : '',
       clockIntervalHours: String(settings.clockIntervalHours ?? 6),
       clockFile: String(settings.clockFile ?? ''),
       injectPerTurn: settings.injectPerTurn !== false,
+      // 三档各自的勾默认开：只有明确是 false 才显示「未勾选」，读坏/缺项都按开显示
+      handoverTemplateEnabled: settings.handoverTemplateEnabled !== false,
+      compactSoonEnabled: settings.compactSoonEnabled !== false,
+      nearlyFullEnabled: settings.nearlyFullEnabled !== false,
       handoverPercent: String(settings.handoverPercent ?? 50),
       compactSoonPercent: String(settings.compactSoonPercent ?? 75),
       nearlyFullPercent: String(settings.nearlyFullPercent ?? 90),
+      ledgerPercent: String(settings.ledgerPercent ?? 50),
       rotateReminderMode: MODES.some((item) => item.value === settings.rotateReminderMode)
         ? settings.rotateReminderMode
         : 'weekly',
@@ -230,6 +259,42 @@ window.__ModuleLoader__.load({
         }, options.map((item) => h('option', { key: item.value, value: item.value }, item.label))))
     }
 
+    /**
+     * 开关行：标题 + 「已开启/已关闭」药丸按钮 + 一行小字。
+     * 现在只剩「每轮注入」一个用这种药丸形状；提醒各档的开关已经改成「百分比填 0」
+     * 加该档自己的复选框（见 CheckBox）。
+     */
+    function SwitchField({ title, note, on, disabled, onHint, offHint, onToggle }) {
+      return h(Field, { title, note },
+        h('div', { style: S.row },
+          h('button', {
+            type: 'button',
+            role: 'switch',
+            'aria-checked': on,
+            disabled,
+            onClick: onToggle,
+            style: S.switchButton(on, disabled),
+          }, on ? '已开启' : '已关闭'),
+          h('span', { style: S.hint }, on ? onHint : offHint)))
+    }
+
+    /**
+     * 复选框 + 文字。提醒区三档各自的那个勾用它：
+     * 交接档是「写交接（落模板文件）」，折叠 / 用完两档是「提醒」。
+     * 该档百分比为 0 时由调用方传 disabled，并另外给一行「该档已关闭」的说明。
+     */
+    function CheckBox({ checked, disabled, label, onChange }) {
+      return h('label', { style: S.check(disabled) },
+        h('input', {
+          type: 'checkbox',
+          checked,
+          disabled,
+          onChange,
+          style: { margin: 0, accentColor: 'currentColor' },
+        }),
+        h('span', null, label))
+    }
+
     function Panel() {
       const [draft, setDraft] = React.useState(null)
       const [loading, setLoading] = React.useState(true)
@@ -290,19 +355,30 @@ window.__ModuleLoader__.load({
         const handover = numOf(draft.handoverPercent)
         const compactSoon = numOf(draft.compactSoonPercent)
         const nearlyFull = numOf(draft.nearlyFullPercent)
-        for (const [value, name] of [
+        const ledger = numOf(draft.ledgerPercent)
+        const tiers = [
           [handover, '提醒交接'],
           [compactSoon, '即将折叠'],
           [nearlyFull, '即将用完'],
-        ]) {
-          if (value === null || !Number.isInteger(value) || value < 1 || value > 100) {
-            setError(name + '必须是 1–100 之间的整数')
+        ]
+        for (const [value, name] of tiers) {
+          if (value === null || !Number.isInteger(value) || value < 0 || value > 100) {
+            setError(name + '必须是 0–100 之间的整数（填 0 = 关闭这一档）')
             return
           }
         }
-        // 三档必须严格递增：不递增就地拦下，不发请求（后端还有一道排序修正）
-        if (!(handover < compactSoon && compactSoon < nearlyFull)) {
-          setError('三档百分比必须递增：提醒交接 < 即将折叠 < 即将用完')
+        // 只有**大于 0** 的三档之间才要求严格递增；0 的档表示关闭，不参与比较。
+        // 例如 50/0/90 合法，0/0/0 也合法；0/70/50 不合法。
+        // 写长期记忆是独立一档，**不参与**这里的比较（可以 50/75/90/50，也可以落在任意位置）。
+        const active = tiers.filter(([value]) => value > 0)
+        for (let index = 1; index < active.length; index += 1) {
+          if (!(active[index - 1][0] < active[index][0])) {
+            setError('大于 0 的档必须递增：提醒交接 < 即将折叠 < 即将用完（写长期记忆不参与递增）')
+            return
+          }
+        }
+        if (ledger === null || !Number.isInteger(ledger) || ledger < 0 || ledger > 100) {
+          setError('写长期记忆必须是 0–100 之间的整数（填 0 = 关闭这一档）')
           return
         }
 
@@ -336,9 +412,15 @@ window.__ModuleLoader__.load({
             clockFile,
             clockIntervalHours: hours,
             injectPerTurn: draft.injectPerTurn,
+            // 三档各自的勾：百分比为 0 时它们不生效，但仍原样保存，改回来就不用重设
             handoverPercent: handover,
+            handoverTemplateEnabled: draft.handoverTemplateEnabled,
             compactSoonPercent: compactSoon,
+            compactSoonEnabled: draft.compactSoonEnabled,
             nearlyFullPercent: nearlyFull,
+            nearlyFullEnabled: draft.nearlyFullEnabled,
+            // 写长期记忆是独立一档，没有勾，只存水位
+            ledgerPercent: ledger,
             rotateReminderMode: mode,
             rotateReminderDays: Number.isInteger(days) && days >= 1 && days <= 365 ? days : 7,
             rotateReminderWeekday:
@@ -399,6 +481,11 @@ window.__ModuleLoader__.load({
       }
 
       const disabled = saving !== ''
+      // 某档填 0 = 整档关闭：它后面的勾跟着置灰（输入到半截 / 非法时不置灰，交给保存校验）
+      const handoverOff = numOf(draft.handoverPercent) === 0
+      const compactSoonOff = numOf(draft.compactSoonPercent) === 0
+      const nearlyFullOff = numOf(draft.nearlyFullPercent) === 0
+      const ledgerOff = numOf(draft.ledgerPercent) === 0
 
       // 周期模式：只显示当前选中的那个输入
       let modeInput = null
@@ -484,64 +571,110 @@ window.__ModuleLoader__.load({
             style: { ...S.input, fontFamily: 'ui-monospace, monospace' },
           })),
 
-        h(Field, {
+        h(SwitchField, {
           title: '每轮注入',
-          note: '每个 turn 的第一步是否注入一条水位读数；关掉后只剩三档提醒和换会话提醒。保存后立即生效。',
-        },
-          h('div', { style: S.row },
-            h('button', {
-              type: 'button',
-              role: 'switch',
-              'aria-checked': draft.injectPerTurn,
-              disabled,
-              onClick: () => setDraft({ ...draft, injectPerTurn: !draft.injectPerTurn }),
-              style: S.switchButton(draft.injectPerTurn, disabled),
-            }, draft.injectPerTurn ? '已开启' : '已关闭'),
-            h('span', { style: S.hint }, draft.injectPerTurn
-              ? '每轮第一步报一条读数'
-              : '不报读数，只留提醒'))),
+          note: '每个 turn 的第一步是否注入一条水位读数；关掉后只剩四档提醒和换会话提醒。保存后立即生效。',
+          on: draft.injectPerTurn,
+          disabled,
+          onHint: '每轮第一步报一条读数',
+          offHint: '不报读数，只留提醒',
+          onToggle: () => setDraft({ ...draft, injectPerTurn: !draft.injectPerTurn }),
+        }),
 
+        /* 提醒区四行，自上而下：交接 → 折叠 → 用完 → 写长期记忆。
+           每行都是「百分比 + 该档自己的勾」；谁填 0 就是关掉谁，勾跟着置灰。
+           交接档的勾管落模板文件；折叠 / 用完两档的勾管发不发这条提醒；
+           写长期记忆没有勾，只注入那一句、不落文件。 */
         h(Field, {
           title: '提醒交接（%）',
-          note: '到这条线提醒把中间结论落盘。范围 1–100 的整数，须小于「即将折叠」。保存后立即生效。',
+          note: handoverOff
+            ? '填 0 = 关闭这一档；只有大于 0 的档之间才要求递增。该档已关闭：不提醒、不落模板文件。'
+            : '填 0 = 关闭这一档；只有大于 0 的档之间才要求递增。到这条线提醒把中间结论落盘。',
         },
-          h(NumberRow, {
-            value: draft.handoverPercent,
-            disabled,
-            min: 1,
-            max: 100,
-            step: 1,
-            unit: '%',
-            onChange: (value) => setDraft({ ...draft, handoverPercent: value }),
-          })),
+          h('div', { style: S.row },
+            h(NumberRow, {
+              value: draft.handoverPercent,
+              disabled,
+              min: 0,
+              max: 100,
+              step: 1,
+              unit: '%',
+              onChange: (value) => setDraft({ ...draft, handoverPercent: value }),
+            }),
+            h(CheckBox, {
+              checked: draft.handoverTemplateEnabled,
+              disabled: disabled || handoverOff,
+              label: '写交接（落模板文件）',
+              onChange: () =>
+                setDraft({ ...draft, handoverTemplateEnabled: !draft.handoverTemplateEnabled }),
+            }),
+            handoverOff ? h('span', { style: S.hint }, '该档已关闭') : null)),
 
         h(Field, {
           title: '即将折叠（%）',
-          note: '到这条线提醒快要折叠了；折叠只留摘要、细节会丢。范围 1–100 的整数，须大于「提醒交接」、小于「即将用完」。保存后立即生效。',
+          note: compactSoonOff
+            ? '填 0 或取消旁边的勾都等于关闭这一档；只有大于 0 的档之间才要求递增。该档已关闭：不提醒。'
+            : '到这条线提醒快要折叠了；折叠只留摘要、细节会丢。填 0 或取消勾选都等于关闭这一档。',
         },
-          h(NumberRow, {
-            value: draft.compactSoonPercent,
-            disabled,
-            min: 1,
-            max: 100,
-            step: 1,
-            unit: '%',
-            onChange: (value) => setDraft({ ...draft, compactSoonPercent: value }),
-          })),
+          h('div', { style: S.row },
+            h(NumberRow, {
+              value: draft.compactSoonPercent,
+              disabled,
+              min: 0,
+              max: 100,
+              step: 1,
+              unit: '%',
+              onChange: (value) => setDraft({ ...draft, compactSoonPercent: value }),
+            }),
+            h(CheckBox, {
+              checked: draft.compactSoonEnabled,
+              disabled: disabled || compactSoonOff,
+              label: '提醒',
+              onChange: () => setDraft({ ...draft, compactSoonEnabled: !draft.compactSoonEnabled }),
+            }),
+            compactSoonOff ? h('span', { style: S.hint }, '该档已关闭') : null)),
 
         h(Field, {
           title: '即将用完（%）',
-          note: '到这条线提醒该换新会话了。范围 1–100 的整数，须大于「即将折叠」。保存后立即生效。',
+          note: nearlyFullOff
+            ? '填 0 或取消旁边的勾都等于关闭这一档；只有大于 0 的档之间才要求递增。该档已关闭：不提醒。'
+            : '到这条线提醒该换新会话了。填 0 或取消勾选都等于关闭这一档。',
         },
-          h(NumberRow, {
-            value: draft.nearlyFullPercent,
-            disabled,
-            min: 1,
-            max: 100,
-            step: 1,
-            unit: '%',
-            onChange: (value) => setDraft({ ...draft, nearlyFullPercent: value }),
-          })),
+          h('div', { style: S.row },
+            h(NumberRow, {
+              value: draft.nearlyFullPercent,
+              disabled,
+              min: 0,
+              max: 100,
+              step: 1,
+              unit: '%',
+              onChange: (value) => setDraft({ ...draft, nearlyFullPercent: value }),
+            }),
+            h(CheckBox, {
+              checked: draft.nearlyFullEnabled,
+              disabled: disabled || nearlyFullOff,
+              label: '提醒',
+              onChange: () => setDraft({ ...draft, nearlyFullEnabled: !draft.nearlyFullEnabled }),
+            }),
+            nearlyFullOff ? h('span', { style: S.hint }, '该档已关闭') : null)),
+
+        h(Field, {
+          title: '写长期记忆（%）',
+          note:
+            '独立一档，不跟交接绑定：到这条线只在注入里说一句「顺带把这一场的结论落进长期记忆」，不落任何文件。' +
+            '填 0 = 关闭这一档，也不参与上面三档的递增。',
+        },
+          h('div', { style: S.row },
+            h(NumberRow, {
+              value: draft.ledgerPercent,
+              disabled,
+              min: 0,
+              max: 100,
+              step: 1,
+              unit: '%',
+              onChange: (value) => setDraft({ ...draft, ledgerPercent: value }),
+            }),
+            h('span', { style: S.hint }, ledgerOff ? '该档已关闭' : '（无勾选，填 0 = 关闭）'))),
 
         h(Field, {
           title: '换会话提醒周期',

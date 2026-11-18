@@ -2,16 +2,27 @@
  * aux：给模型读上下文水位，顺带给时钟文件续行，按周期提醒换会话。
  *
  * 四件事：
- *   1. 每个 turn 的第一步注入一条水位读数；占比跨过三档线时各额外注入一次对应提醒
+ *   1. 每个 turn 的第一步注入一条水位读数；占比跨过档位线时各额外注入一次对应提醒
  *      （同一个会话里每档只提醒一次）：
  *        - handoverPercent（默认 50）：该写交接了；
  *        - compactSoonPercent（默认 75）：快到折叠线了；
- *        - nearlyFullPercent（默认 90）：该换新会话了。
- *      三档提醒不受 injectPerTurn 影响，该说照说。
+ *        - nearlyFullPercent（默认 90）：该换新会话了；
+ *        - ledgerPercent（默认 50）：顺带把这一场的结论落进长期记忆。
+ *      前三档是提醒阶梯，**百分比填 0 就是关掉那一档**；折叠 / 用完两档还各有一个勾
+ *      （compactSoonEnabled / nearlyFullEnabled）管「发不发这条提醒」，不勾与填 0 等效。
+ *      交接档的勾（handoverTemplateEnabled）不管发不发提醒——它只管**落不落模板文件**。
+ *      ledgerPercent 是**独立一档**：不挂在交接档上，也不参与前三档的递增阶梯，
+ *      只注入「顺带把这一场的结论落进长期记忆。」那一句，不落任何文件；填 0 = 关闭。
+ *      关掉的档（百分比为 0，或该档的勾没勾）整档不注入，也不占掉它的「每会话一次」名额，
+ *      其它档位/读数/时钟/换新提醒一概不受影响。之后重新打开、水位又已经在线，会补发那一次。
+ *      交接档被打开（handoverPercent > 0）时总是发「该写交接了」那条提醒；
+ *      只有勾了 handoverTemplateEnabled 才落模板文件，并在提醒里追加「模板已生成：<路径>」；
+ *      不勾则只提醒，文案里不出现这一行，文件早就存在也不提。
+ *      「落进长期记忆」那句不探测 mnemon 在不在（mnemon 是唯一可选的插件依赖）。
  *      跨过 handover 这一档时**额外落一份交接模板文件**（只写文件，不塞进注入正文）：
  *      写在 clockFile 同目录，文件名 `交接-<yyyy-MM-dd>-<会话 id 后 8 位>.md`，
  *      已存在就不覆盖、不追加，注入里只追加一行指针 `模板已生成：<绝对路径>`。
- *      compactSoon / nearlyFull 不生成模板；范围外的会话不注入，也就不生成。
+ *      compactSoon / nearlyFull / ledger 不生成模板；范围外的会话不注入，也就不生成。
  *   2. 按 clockIntervalHours 往 clockFile 追加一行 `YYYY-MM-DD HH:mm`，能读到水位时
  *      追加 ` 上下文 NN%`；进程启动时先补写一行。
  *   3. 换新提醒：**每次 pre-step 都检查**（不限第几步）；周期三选一（`rotateReminderMode`）：
@@ -84,24 +95,39 @@ export const inject = ['agents', 'tokenMeter'];
  * 三档提醒：每一档一句自己的话，语义各不相同。
  *
  * 文案里的 X 是**当前占比**，不是阈值本身——同一档线在一次会话里只会被跨过一次。
+ *
+ * 这里只有 `percentKey`：**该百分比为 0 就表示这一档关闭**。
+ * compactSoon / nearlyFull 另有 `enabledKey`（该档自己的勾）：勾没勾也算关闭，与填 0 等效。
+ * 交接档没有 `enabledKey`——它的勾（handoverTemplateEnabled）管的是落模板文件，不是发不发提醒，
+ * 所以在下面的循环里单独处理。某档关闭时整档跳过（不注入、不落模板），
+ * 也**不占掉它的一次性名额**；其它档位不受影响。
+ *
+ * 「写长期记忆」不在这张表里：它是独立一档（ledgerPercent），在循环后面单独判断，
+ * 只注入一句话、不落文件，也不跟交接档绑定。
  */
 const REMINDERS = Object.freeze([
   {
     key: 'handover',
     percentKey: 'handoverPercent',
+    enabledKey: null,
     text: (percent) => `上下文 ${percent}%：该写交接了——长任务先把结论落盘，再往下做。`,
   },
   {
     key: 'compactSoon',
     percentKey: 'compactSoonPercent',
+    enabledKey: 'compactSoonEnabled',
     text: (percent) => `上下文 ${percent}%：快到折叠线了。折叠只留摘要，细节会丢；重要结论先落盘。`,
   },
   {
     key: 'nearlyFull',
     percentKey: 'nearlyFullPercent',
+    enabledKey: 'nearlyFullEnabled',
     text: (percent) => `上下文 ${percent}%：快满了，该换新会话了。`,
   },
 ]);
+
+/** 写长期记忆这一档的注入文案：只有这一句，不探测 mnemon 在不在，也不落任何文件。 */
+const LEDGER_REMINDER_TEXT = '顺带把这一场的结论落进长期记忆。';
 
 /** token 数按 K 显示，去掉无意义的 .0 尾巴；不足 1K 就报原数。 */
 function fmtTokens(value) {
@@ -218,7 +244,10 @@ export function apply(ctx, config) {
 
   /** 最近一次读到的水位，供时钟行使用；没读到就写纯时间。 */
   let lastPercent = null;
-  /** 每个会话已经提醒过的提醒档（handover / compactSoon / nearlyFull），避免同一档反复说。 */
+  /**
+   * 每个会话已经提醒过的档位（handover / compactSoon / nearlyFull / ledger），避免同一档反复说。
+   * 关掉的档不往这里记账，所以重新打开后还能补发一次。
+   */
   const notified = new Map();
 
   /**
@@ -435,19 +464,40 @@ export function apply(ctx, config) {
         );
       }
       // 跨过新的一档时不管第几步都额外说一次，每档每会话只说一次。
-      // handover 这一档额外落一份模板文件（只写文件），文案里再追加一行指针。
-      // 模板只在 handover 生成；compactSoon / nearlyFull 只提醒，不落文件。
+      // 每一档先看自己的百分比：为 0 就表示这一档关闭，整档跳过、连「已提醒」都不记——
+      // 不占掉它的一次性名额，中途把它改回大于 0 还能补上。折叠 / 用完两档再看它们自己的勾：
+      // 勾没勾也算关闭（与填 0 等效），同样不记名额。别的档位、读数、时钟行、换新提醒全不受影响。
+      // handover 这一档额外落一份模板文件（只写文件），文案里再追加一行指针；
+      // 模板受 handoverTemplateEnabled 管：不勾时只发提醒，文案里不提「模板已生成」，
+      // 哪怕文件之前已经生成过也不提。模板只在 handover 生成；其它档只提醒。
       for (const reminder of REMINDERS) {
         const threshold = settings[reminder.percentKey];
+        // 0 = 关闭这一档（normalizeSettings 已保证是 0–100 的整数）
+        if (!(threshold > 0)) continue;
+        // 折叠 / 用完两档的勾：未勾 = 关闭这一档
+        if (reminder.enabledKey !== null && settings[reminder.enabledKey] !== true) continue;
         if (watermark.percent < threshold || seen.has(reminder.key)) continue;
         seen.add(reminder.key);
         let text = reminder.text(watermark.percent);
-        if (reminder.key === 'handover') {
+        if (reminder.key === 'handover' && settings.handoverTemplateEnabled) {
+          // 交接档的勾只管落模板：不勾就走不到这里，提醒照发、只是少了这一行
           const templateFile = ensureHandoverTemplate(settings, sessionId);
           // 写失败就只是少了这一行：提醒照发，不假装文件已经在了
           if (templateFile !== null) text += `\n模板已生成：${templateFile}`;
         }
         texts.push(text);
+      }
+      // 写长期记忆是**独立一档**，不挂在交接档上：用自己的水位、自己的名额，
+      // 只注入那一句、不落任何文件；与交接/折叠/用完三档互不影响，位置可以各不相同。
+      // 填 0 = 关闭这一档，同样不记名额（之后改回大于 0 且水位已在线会补发一次）。
+      if (
+        settings.ledgerPercent > 0 &&
+        watermark.percent >= settings.ledgerPercent &&
+        !seen.has('ledger')
+      ) {
+        seen.add('ledger');
+        // 其它三档都带水位前缀，这一句也带上，免得看不出是哪条触发线
+        texts.push(`上下文 ${watermark.percent}%：${LEDGER_REMINDER_TEXT}`);
       }
       // 换新提醒：每次 pre-step 都查（不限第几步）。周期三选一（interval / weekly / monthly），
       // 「周几 / 几号」按 timeZone 算本地日期；从未提醒过就立刻提醒。
