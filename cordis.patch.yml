@@ -9,9 +9,9 @@
         handoverPercent: 50
         handoverTemplateEnabled: true
         compactSoonPercent: 75
-        compactSoonEnabled: true
+        compactSoonHandoverEnabled: true
         nearlyFullPercent: 90
-        nearlyFullEnabled: true
+        nearlyFullHandoverEnabled: true
         ledgerPercent: 50
         rotateReminderMode: weekly
         rotateReminderDays: 7

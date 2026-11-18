@@ -9,7 +9,7 @@
  */
 import assert from 'node:assert/strict';
 
-import { dateKey, renderTemplate, templateFileName } from '../lib/handover.js';
+import { dateKey, renderTemplate, renderUpdateBlock, templateFileName } from '../lib/handover.js';
 
 /** 本地时间 2026-11-18 深夜：证明取的是本地日期，不是 UTC 日期。 */
 const LOCAL_DAY = new Date(2026, 10, 18, 23, 30, 0);
@@ -113,6 +113,45 @@ test('模板以换行结尾、按日期与 id 变化', () => {
   // 同一份输入永远同一份正文（纯函数）
   assert.equal(body, renderTemplate('2026-01-02', 'abcdefgh-1234'));
   assert.notEqual(body, renderTemplate('2026-01-03', 'abcdefgh-1234'));
+});
+
+test('renderUpdateBlock：标题带档位百分比与 HH:mm，正文只留空位', () => {
+  assert.equal(
+    renderUpdateBlock(70, '09:05'),
+    '## 更新 · 70%（09:05）\n\n（这一档的进展、新结论、状态变化，补在这里）\n',
+  );
+  assert.equal(
+    renderUpdateBlock(90, '23:59'),
+    '## 更新 · 90%（23:59）\n\n（这一档的进展、新结论、状态变化，补在这里）\n',
+  );
+  // 标题行单独一行，末尾以换行收口（调用方在前面补一个空行再追加）
+  const block = renderUpdateBlock(75, '00:00');
+  assert.equal(block.split('\n')[0], '## 更新 · 75%（00:00）');
+  assert.ok(block.endsWith('\n'));
+  // 纯函数：同样入参同样输出；百分比不同就不同
+  assert.equal(block, renderUpdateBlock(75, '00:00'));
+  assert.notEqual(block, renderUpdateBlock(90, '00:00'));
+});
+
+test('renderUpdateBlock：坏时间 / 越界百分比也能拼出成型标题', () => {
+  // 时间是空值 / 非字符串时退回 --:--，不出现 undefined
+  for (const bad of ['', '   ', null, undefined, 42]) {
+    const block = renderUpdateBlock(70, bad);
+    assert.ok(block.startsWith('## 更新 · 70%（--:--）\n'), block.split('\n')[0]);
+    assert.ok(!block.includes('undefined'), '不能把 undefined 拼进标题');
+  }
+  // 百分比钳到 0–100 的整数；小数四舍五入
+  assert.ok(renderUpdateBlock(-5, '09:05').startsWith('## 更新 · 0%（09:05）'));
+  assert.ok(renderUpdateBlock(250, '09:05').startsWith('## 更新 · 100%（09:05）'));
+  assert.ok(renderUpdateBlock(70.6, '09:05').startsWith('## 更新 · 71%（09:05）'));
+});
+
+test('更新块追加在模板之后：模板五段在前，更新块是后来的第二段', () => {
+  const body = `${renderTemplate('2026-11-18', 'abcdefgh-1234')}\n${renderUpdateBlock(70, '09:05')}`;
+  // 更新块在模板最后一截之后，且和上文之间有一行空行
+  assert.ok(body.includes('（有则写改了什么、什么时候；没有就写「没有」）\n\n## 更新 · 70%（09:05）'));
+  // 更新块没有改动模板正文里的五个小标题
+  assert.ok(body.indexOf('## 一、本场做了什么') < body.indexOf('## 更新 · 70%'));
 });
 
 console.log(`PASS ${passed}`);

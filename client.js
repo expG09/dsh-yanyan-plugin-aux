@@ -24,15 +24,16 @@
  * 换会话提醒周期（三选一，选中哪个就只显示对应那个输入）。每项下面都有一行小字，
  * 说清「管什么、范围多少、什么时候生效」。
  *
- * 提醒区自上而下四行，每行都是「百分比 + 该档自己的勾」：
- *     提醒交接（%）   [ 50 ] %   ☑ 写交接（落模板文件）
- *     即将折叠（%）   [ 75 ] %   ☑ 提醒
- *     即将用完（%）   [ 90 ] %   ☑ 提醒
- *     写长期记忆（%） [ 50 ] %   （无勾选，填 0 = 关闭）
- * 规矩：**百分比填 0 = 关闭这一档**。折叠 / 用完两档的勾管「发不发这条提醒」，不勾与填 0 等效；
- * 交接档的勾管的是「落不落模板文件」，不勾只是不落盘，交接提醒照发。某档为 0 时它后面的勾
- * 置灰禁用，并提示「该档已关闭」。写长期记忆是独立一档：不挂在交接档上，只注入那一句、
- * 不落文件，填 0 就关闭，也没有勾。
+ * 提醒区自上而下四行，每行都是「百分比 [+ 该档自己的勾]」（方括号里的数是当前设置值）：
+ *     提醒交接（%）   [ 50 ] %   ☑ 写交接
+ *     即将折叠（%）   [ 75 ] %   ☑ 写交接
+ *     即将用完（%）   [ 90 ] %   ☑ 写交接
+ *     写长期记忆（%） [ 50 ] %   填 0 = 关闭
+ * 规矩：**百分比填 0 = 关闭这一档**。三档的勾统一叫「写交接」，默认全部勾选：
+ * 勾选则这一档写/更新交接文件，不勾只发提醒（提醒照发，只是不写文件）。
+ * 三档写的是**同一份交接文件**：交接档首次写，折叠 / 用完两档各更新一次（不是新建）。
+ * 某档为 0 时它后面的勾置灰禁用，并提示「该档已关闭」。写长期记忆是独立一档：
+ * 不挂在交接档上，只注入那一句、不落文件，填 0 就关闭，也没有勾。
  * 「生效范围」放在最上面，因为它是**全局**的：留空 = 所有会话都收到读数与提醒，非空就只在
  * 匹配的会话里注入（时钟行不受影响）。
  * 递增只对**大于 0** 的三档有要求（提醒交接 < 即将折叠 < 即将用完）；写长期记忆独立，
@@ -186,10 +187,10 @@ window.__ModuleLoader__.load({
       clockIntervalHours: String(settings.clockIntervalHours ?? 6),
       clockFile: String(settings.clockFile ?? ''),
       injectPerTurn: settings.injectPerTurn !== false,
-      // 三档各自的勾默认开：只有明确是 false 才显示「未勾选」，读坏/缺项都按开显示
+      // 三档各自的「写交接」勾默认开：只有明确是 false 才显示「未勾选」，读坏/缺项都按开显示
       handoverTemplateEnabled: settings.handoverTemplateEnabled !== false,
-      compactSoonEnabled: settings.compactSoonEnabled !== false,
-      nearlyFullEnabled: settings.nearlyFullEnabled !== false,
+      compactSoonHandoverEnabled: settings.compactSoonHandoverEnabled !== false,
+      nearlyFullHandoverEnabled: settings.nearlyFullHandoverEnabled !== false,
       handoverPercent: String(settings.handoverPercent ?? 50),
       compactSoonPercent: String(settings.compactSoonPercent ?? 75),
       nearlyFullPercent: String(settings.nearlyFullPercent ?? 90),
@@ -279,8 +280,8 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 复选框 + 文字。提醒区三档各自的那个勾用它：
-     * 交接档是「写交接（落模板文件）」，折叠 / 用完两档是「提醒」。
+     * 复选框 + 文字。提醒区三档各自的「写交接」勾用它：
+     * 勾选则这一档写/更新交接文件，不勾只发提醒（提醒照发，只是不写文件）。
      * 该档百分比为 0 时由调用方传 disabled，并另外给一行「该档已关闭」的说明。
      */
     function CheckBox({ checked, disabled, label, onChange }) {
@@ -412,13 +413,13 @@ window.__ModuleLoader__.load({
             clockFile,
             clockIntervalHours: hours,
             injectPerTurn: draft.injectPerTurn,
-            // 三档各自的勾：百分比为 0 时它们不生效，但仍原样保存，改回来就不用重设
+            // 三档各自的「写交接」勾：百分比为 0 时它们不生效，但仍原样保存，改回来就不用重设
             handoverPercent: handover,
             handoverTemplateEnabled: draft.handoverTemplateEnabled,
             compactSoonPercent: compactSoon,
-            compactSoonEnabled: draft.compactSoonEnabled,
+            compactSoonHandoverEnabled: draft.compactSoonHandoverEnabled,
             nearlyFullPercent: nearlyFull,
-            nearlyFullEnabled: draft.nearlyFullEnabled,
+            nearlyFullHandoverEnabled: draft.nearlyFullHandoverEnabled,
             // 写长期记忆是独立一档，没有勾，只存水位
             ledgerPercent: ledger,
             rotateReminderMode: mode,
@@ -583,13 +584,12 @@ window.__ModuleLoader__.load({
 
         /* 提醒区四行，自上而下：交接 → 折叠 → 用完 → 写长期记忆。
            每行都是「百分比 + 该档自己的勾」；谁填 0 就是关掉谁，勾跟着置灰。
-           交接档的勾管落模板文件；折叠 / 用完两档的勾管发不发这条提醒；
+           三档的勾统一叫「写交接」：勾选则这一档写/更新交接文件，不勾只发提醒。
+           三档写同一份文件——交接档首次写，折叠 / 用完两档各更新一次，不是各起一份。
            写长期记忆没有勾，只注入那一句、不落文件。 */
         h(Field, {
           title: '提醒交接（%）',
-          note: handoverOff
-            ? '填 0 = 关闭这一档；只有大于 0 的档之间才要求递增。该档已关闭：不提醒、不落模板文件。'
-            : '填 0 = 关闭这一档；只有大于 0 的档之间才要求递增。到这条线提醒把中间结论落盘。',
+          note: '填 0 = 关闭这一档；勾选则这一档写/更新交接文件，不勾只发提醒。',
         },
           h('div', { style: S.row },
             h(NumberRow, {
@@ -604,7 +604,7 @@ window.__ModuleLoader__.load({
             h(CheckBox, {
               checked: draft.handoverTemplateEnabled,
               disabled: disabled || handoverOff,
-              label: '写交接（落模板文件）',
+              label: '写交接',
               onChange: () =>
                 setDraft({ ...draft, handoverTemplateEnabled: !draft.handoverTemplateEnabled }),
             }),
@@ -612,9 +612,7 @@ window.__ModuleLoader__.load({
 
         h(Field, {
           title: '即将折叠（%）',
-          note: compactSoonOff
-            ? '填 0 或取消旁边的勾都等于关闭这一档；只有大于 0 的档之间才要求递增。该档已关闭：不提醒。'
-            : '到这条线提醒快要折叠了；折叠只留摘要、细节会丢。填 0 或取消勾选都等于关闭这一档。',
+          note: '到这里会更新同一份交接文件（不是新建）。填 0 = 关闭。',
         },
           h('div', { style: S.row },
             h(NumberRow, {
@@ -627,18 +625,17 @@ window.__ModuleLoader__.load({
               onChange: (value) => setDraft({ ...draft, compactSoonPercent: value }),
             }),
             h(CheckBox, {
-              checked: draft.compactSoonEnabled,
+              checked: draft.compactSoonHandoverEnabled,
               disabled: disabled || compactSoonOff,
-              label: '提醒',
-              onChange: () => setDraft({ ...draft, compactSoonEnabled: !draft.compactSoonEnabled }),
+              label: '写交接',
+              onChange: () =>
+                setDraft({ ...draft, compactSoonHandoverEnabled: !draft.compactSoonHandoverEnabled }),
             }),
             compactSoonOff ? h('span', { style: S.hint }, '该档已关闭') : null)),
 
         h(Field, {
           title: '即将用完（%）',
-          note: nearlyFullOff
-            ? '填 0 或取消旁边的勾都等于关闭这一档；只有大于 0 的档之间才要求递增。该档已关闭：不提醒。'
-            : '到这条线提醒该换新会话了。填 0 或取消勾选都等于关闭这一档。',
+          note: '同上，最后一次更新。填 0 = 关闭。',
         },
           h('div', { style: S.row },
             h(NumberRow, {
@@ -651,10 +648,11 @@ window.__ModuleLoader__.load({
               onChange: (value) => setDraft({ ...draft, nearlyFullPercent: value }),
             }),
             h(CheckBox, {
-              checked: draft.nearlyFullEnabled,
+              checked: draft.nearlyFullHandoverEnabled,
               disabled: disabled || nearlyFullOff,
-              label: '提醒',
-              onChange: () => setDraft({ ...draft, nearlyFullEnabled: !draft.nearlyFullEnabled }),
+              label: '写交接',
+              onChange: () =>
+                setDraft({ ...draft, nearlyFullHandoverEnabled: !draft.nearlyFullHandoverEnabled }),
             }),
             nearlyFullOff ? h('span', { style: S.hint }, '该档已关闭') : null)),
 
@@ -674,7 +672,7 @@ window.__ModuleLoader__.load({
               unit: '%',
               onChange: (value) => setDraft({ ...draft, ledgerPercent: value }),
             }),
-            h('span', { style: S.hint }, ledgerOff ? '该档已关闭' : '（无勾选，填 0 = 关闭）'))),
+            h('span', { style: S.hint }, ledgerOff ? '填 0 = 关闭（该档已关闭）' : '填 0 = 关闭'))),
 
         h(Field, {
           title: '换会话提醒周期',

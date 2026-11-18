@@ -4,11 +4,13 @@
  * 跑法：`node test/settings.test.mjs`
  * 不需要任何测试框架，也不需要装 @deepseek-ai 依赖；全部通过时最后一行为 `PASS <用例数>`。
  *
- * 2.5.0 起的重点：
- *   - 三档提醒的开关仍是「百分比填 0」；折叠 / 用完两档另加回自己的勾，勾未选与填 0 等效；
+ * 2.6.0 起的重点：
+ *   - 三档提醒的开关仍是「百分比填 0」；三档各有一个「写交接」勾，勾只决定写/更新交接文件，
+ *     不决定提醒发不发；
  *   - 写长期记忆（ledgerPercent）是**独立一档**：0 合法、越界钳制、不参与三档递增；
  *   - 四个档各自关闭互不影响；
- *   - 旧键 templateEnabled / ledgerReminderEnabled 被静默忽略。
+ *   - 旧键 templateEnabled / ledgerReminderEnabled，以及 2.5.0 的 compactSoonEnabled /
+ *     nearlyFullEnabled 被静默忽略（不做改名映射）。
  */
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -29,10 +31,10 @@ const BASE = {
   clockFile: 'D:\\base\\clock.md',
   clockIntervalHours: 6,
   injectPerTurn: true,
-  // 三个勾在 BASE 里故意都是 false：出厂默认是 true，才能分清「回落 base」和「回落默认」
+  // 三个「写交接」勾在 BASE 里故意都是 false：出厂默认是 true，才能分清「回落 base」和「回落默认」
   handoverTemplateEnabled: false,
-  compactSoonEnabled: false,
-  nearlyFullEnabled: false,
+  compactSoonHandoverEnabled: false,
+  nearlyFullHandoverEnabled: false,
   handoverPercent: 40,
   compactSoonPercent: 65,
   nearlyFullPercent: 85,
@@ -45,10 +47,21 @@ const BASE = {
 };
 
 /** 已经删掉 / 改名 / 被新键取代的旧键：任何输入里出现都不该回到结果里。 */
-const REMOVED_KEYS = ['handoverEnabled', 'templateEnabled', 'ledgerReminderEnabled'];
+const REMOVED_KEYS = [
+  'handoverEnabled',
+  'templateEnabled',
+  'ledgerReminderEnabled',
+  // 2.5.0 的旧名，2.6.0 改成 compactSoonHandoverEnabled / nearlyFullHandoverEnabled
+  'compactSoonEnabled',
+  'nearlyFullEnabled',
+];
 
-/** 三个勾的键（交接档的落模板 + 折叠 / 用完两档的发提醒），后面几条用例共用。 */
-const CHECK_KEYS = ['handoverTemplateEnabled', 'compactSoonEnabled', 'nearlyFullEnabled'];
+/** 三个「写交接」勾的键，后面几条用例共用。 */
+const CHECK_KEYS = [
+  'handoverTemplateEnabled',
+  'compactSoonHandoverEnabled',
+  'nearlyFullHandoverEnabled',
+];
 
 let passed = 0;
 
@@ -92,10 +105,10 @@ try {
     assert.deepEqual(DEFAULT_SETTINGS.clockFile, 'G:\\yanyan-workspace\\report-cache\\clock.md');
     assert.equal(DEFAULT_SETTINGS.clockIntervalHours, 6);
     assert.equal(DEFAULT_SETTINGS.injectPerTurn, true);
-    // 三个勾：出厂默认都开
+    // 三个「写交接」勾：出厂默认都开
     assert.equal(DEFAULT_SETTINGS.handoverTemplateEnabled, true);
-    assert.equal(DEFAULT_SETTINGS.compactSoonEnabled, true);
-    assert.equal(DEFAULT_SETTINGS.nearlyFullEnabled, true);
+    assert.equal(DEFAULT_SETTINGS.compactSoonHandoverEnabled, true);
+    assert.equal(DEFAULT_SETTINGS.nearlyFullHandoverEnabled, true);
     // 四个档默认都开着（都不是 0）
     assert.equal(DEFAULT_SETTINGS.handoverPercent, 50);
     assert.equal(DEFAULT_SETTINGS.compactSoonPercent, 75);
@@ -112,9 +125,11 @@ try {
     for (const gone of REMOVED_KEYS) {
       assert.equal(gone in DEFAULT_SETTINGS, false, `${gone} 应从出厂默认里删掉`);
     }
-    // 2.4.0 删过的两个勾现在回来了
-    assert.equal('compactSoonEnabled' in DEFAULT_SETTINGS, true);
-    assert.equal('nearlyFullEnabled' in DEFAULT_SETTINGS, true);
+    // 2.6.0 的改名：新键在，2.5.0 的旧名已经不在默认对象里
+    assert.equal('compactSoonHandoverEnabled' in DEFAULT_SETTINGS, true);
+    assert.equal('nearlyFullHandoverEnabled' in DEFAULT_SETTINGS, true);
+    assert.equal('compactSoonEnabled' in DEFAULT_SETTINGS, false);
+    assert.equal('nearlyFullEnabled' in DEFAULT_SETTINGS, false);
   });
 
   test('非法小时数回落到 base', () => {
@@ -419,7 +434,7 @@ try {
     assert.equal(normalizeSettings({ injectPerTurn: false }, BASE).injectPerTurn, false);
   });
 
-  test('三个勾：默认 true，非布尔回落 base，真布尔照收', () => {
+  test('三个「写交接」勾：默认 true，非布尔回落 base，真布尔照收', () => {
     for (const key of CHECK_KEYS) {
       // 出厂默认 true
       assert.equal(DEFAULT_SETTINGS[key], true, `${key} 出厂默认应为 true`);
@@ -450,6 +465,28 @@ try {
       assert.equal(out.injectPerTurn, true);
       assert.equal(out.ledgerPercent, allOn.ledgerPercent);
       assert.deepEqual(ladderOf(out), ladderOf(normalizeSettings({}, allOn)));
+    }
+  });
+
+  test('compactSoonHandoverEnabled / nearlyFullHandoverEnabled 非布尔回落（2.6.0 改名）', () => {
+    // 2.5.0 的旧名不在结果里（静默忽略，见稍后的旧键用例），这里只看改名后的两个新键
+    for (const key of ['compactSoonHandoverEnabled', 'nearlyFullHandoverEnabled']) {
+      // 典型手改：字符串 "false" / "true" / 数字 0 / 1 / null 都不算布尔，回落 base（BASE 里是 false）
+      for (const bad of ['false', 'true', '0', 0, 1, null, undefined, {}, [], Number.NaN]) {
+        assert.equal(
+          normalizeSettings({ [key]: bad }, BASE)[key],
+          BASE[key],
+          `${key}=${String(bad)} 应回落 base（BASE 里是 false）`,
+        );
+      }
+      // base 也没有合法布尔时回落出厂默认 true
+      assert.equal(normalizeSettings({ [key]: 'yes' }, {})[key], true, `${key} 应回落默认 true`);
+      // 真布尔两个方向都认
+      assert.equal(normalizeSettings({ [key]: true }, BASE)[key], true);
+      assert.equal(
+        normalizeSettings({ [key]: false }, { ...BASE, [key]: true })[key],
+        false,
+      );
     }
   });
 
@@ -523,15 +560,15 @@ try {
       nearlyFullPercent: 90,
       ledgerPercent: 50,
       handoverTemplateEnabled: true,
-      compactSoonEnabled: true,
-      nearlyFullEnabled: true,
+      compactSoonHandoverEnabled: true,
+      nearlyFullHandoverEnabled: true,
     };
     const baseline = normalizeSettings({}, allOn);
     // 每次只动一项：只有它自己变，其余三项（含读数、时钟、换新）原样
     const cases = [
       [{ handoverPercent: 0 }, 'handoverPercent'],
-      [{ compactSoonEnabled: false }, 'compactSoonEnabled'],
-      [{ nearlyFullEnabled: false }, 'nearlyFullEnabled'],
+      [{ compactSoonHandoverEnabled: false }, 'compactSoonHandoverEnabled'],
+      [{ nearlyFullHandoverEnabled: false }, 'nearlyFullHandoverEnabled'],
       [{ ledgerPercent: 0 }, 'ledgerPercent'],
     ];
     for (const [patch, key] of cases) {
@@ -547,7 +584,14 @@ try {
     }
   });
 
-  test('旧键 templateEnabled / ledgerReminderEnabled / handoverEnabled 被静默忽略', () => {
+  test('旧键 templateEnabled / ledgerReminderEnabled / handoverEnabled / 2.5.0 旧名被静默忽略', () => {
+    // 三个「写交接」勾在 base 里都开着，才能看出旧键的 false 没顺手把新键关掉
+    const allOnBase = {
+      ...BASE,
+      handoverTemplateEnabled: true,
+      compactSoonHandoverEnabled: true,
+      nearlyFullHandoverEnabled: true,
+    };
     const out = normalizeSettings(
       {
         // 2.4.0 的旧键（templateEnabled 已改名，ledgerReminderEnabled 被 ledgerPercent 取代）
@@ -555,39 +599,50 @@ try {
         ledgerReminderEnabled: false,
         // 更老的旧开关
         handoverEnabled: false,
+        // 2.5.0 的旧名：2.6.0 改成 compactSoonHandoverEnabled / nearlyFullHandoverEnabled
+        compactSoonEnabled: false,
+        nearlyFullEnabled: false,
         handoverPercent: 50,
       },
-      BASE,
+      allOnBase,
     );
     for (const gone of REMOVED_KEYS) {
       assert.equal(gone in out, false, `${gone} 不该出现在规整结果里`);
       assert.equal(out[gone], undefined);
     }
     // 旧键的 false 不会顺手把新键关掉：三个勾按 base 回落，四档按 base / 输入走
-    assert.equal(out.handoverTemplateEnabled, BASE.handoverTemplateEnabled);
-    assert.equal(out.compactSoonEnabled, BASE.compactSoonEnabled);
-    assert.equal(out.nearlyFullEnabled, BASE.nearlyFullEnabled);
-    assert.equal(out.ledgerPercent, BASE.ledgerPercent);
+    assert.equal(out.handoverTemplateEnabled, allOnBase.handoverTemplateEnabled);
+    assert.equal(out.compactSoonHandoverEnabled, allOnBase.compactSoonHandoverEnabled);
+    assert.equal(out.nearlyFullHandoverEnabled, allOnBase.nearlyFullHandoverEnabled);
+    assert.equal(out.ledgerPercent, allOnBase.ledgerPercent);
     // 三档本身也不受旧开关影响：交接 50 照收，另外两档回落 base 的 65 / 85
     assert.deepEqual(ladderOf(out), [50, 65, 85]);
     // 只显式传 0 才关档
-    const withZero = normalizeSettings({ handoverEnabled: false, handoverPercent: 0 }, BASE);
+    const withZero = normalizeSettings({ handoverEnabled: false, handoverPercent: 0 }, allOnBase);
     assert.deepEqual(ladderOf(withZero), [0, 65, 85]);
-    // 老设置文件（2.4.0 写的）里残留这两个键也能直接读回来：不报错、不回到结果里
+    // 老设置文件（2.4.0 / 2.5.0 写的）里残留这些键也能直接读回来：不报错、不回到结果里
     const legacyFile = join(workDir, 'legacy-2.4.json');
     writeFileSync(
       legacyFile,
       JSON.stringify({
         templateEnabled: false,
         ledgerReminderEnabled: false,
+        compactSoonEnabled: false,
+        nearlyFullEnabled: false,
         handoverPercent: 55,
       }),
       'utf8',
     );
     const legacy = readSettings(legacyFile, BASE);
     assert.equal(legacy.handoverPercent, 55);
-    assert.equal('templateEnabled' in legacy, false);
-    assert.equal('ledgerReminderEnabled' in legacy, false);
+    for (const gone of REMOVED_KEYS) {
+      assert.equal(gone in legacy, false, `${gone} 不该出现在读回的结果里`);
+    }
+    // 读老文件时，旧键的 false 不会把改名后的两个新勾关掉：回落到 base（这里是 false）
+    // 或出厂默认 true，但不是「被旧键带成 false」的假象——单独用默认 base 验一次
+    const legacyDefault = readSettings(legacyFile);
+    assert.equal(legacyDefault.compactSoonHandoverEnabled, DEFAULT_SETTINGS.compactSoonHandoverEnabled);
+    assert.equal(legacyDefault.nearlyFullHandoverEnabled, DEFAULT_SETTINGS.nearlyFullHandoverEnabled);
   });
 
   test('旧的 thresholds 数组被忽略，不影响新键', () => {
@@ -641,9 +696,9 @@ try {
       handoverPercent: 0,
       handoverTemplateEnabled: false,
       compactSoonPercent: 60,
-      compactSoonEnabled: false,
+      compactSoonHandoverEnabled: false,
       nearlyFullPercent: 90,
-      nearlyFullEnabled: true,
+      nearlyFullHandoverEnabled: true,
       ledgerPercent: 0,
       rotateReminderMode: 'interval',
       rotateReminderDays: 3,
@@ -683,9 +738,9 @@ try {
       handoverPercent: 20,
       handoverTemplateEnabled: DEFAULT_SETTINGS.handoverTemplateEnabled,
       compactSoonPercent: 80,
-      compactSoonEnabled: DEFAULT_SETTINGS.compactSoonEnabled,
+      compactSoonHandoverEnabled: DEFAULT_SETTINGS.compactSoonHandoverEnabled,
       nearlyFullPercent: DEFAULT_SETTINGS.nearlyFullPercent,
-      nearlyFullEnabled: DEFAULT_SETTINGS.nearlyFullEnabled,
+      nearlyFullHandoverEnabled: DEFAULT_SETTINGS.nearlyFullHandoverEnabled,
       ledgerPercent: DEFAULT_SETTINGS.ledgerPercent,
       rotateReminderMode: DEFAULT_SETTINGS.rotateReminderMode,
       rotateReminderDays: 365,

@@ -8,21 +8,26 @@
  *        - compactSoonPercent（默认 75）：快到折叠线了；
  *        - nearlyFullPercent（默认 90）：该换新会话了；
  *        - ledgerPercent（默认 50）：顺带把这一场的结论落进长期记忆。
- *      前三档是提醒阶梯，**百分比填 0 就是关掉那一档**；折叠 / 用完两档还各有一个勾
- *      （compactSoonEnabled / nearlyFullEnabled）管「发不发这条提醒」，不勾与填 0 等效。
- *      交接档的勾（handoverTemplateEnabled）不管发不发提醒——它只管**落不落模板文件**。
+ *      前三档是提醒阶梯，**百分比填 0 就是关掉那一档**。三档各有一个「写交接」勾
+ *      （handoverTemplateEnabled / compactSoonHandoverEnabled / nearlyFullHandoverEnabled）：
+ *      勾只决定**这一档要不要写/更新交接文件**，不决定提醒发不发——百分比大于 0 时
+ *      三档的提醒照发，不勾只是注入里不出现「已生成 / 已更新」。
  *      ledgerPercent 是**独立一档**：不挂在交接档上，也不参与前三档的递增阶梯，
  *      只注入「顺带把这一场的结论落进长期记忆。」那一句，不落任何文件；填 0 = 关闭。
- *      关掉的档（百分比为 0，或该档的勾没勾）整档不注入，也不占掉它的「每会话一次」名额，
+ *      关掉的档（百分比为 0）整档不注入，也不占掉它的「每会话一次」名额，
  *      其它档位/读数/时钟/换新提醒一概不受影响。之后重新打开、水位又已经在线，会补发那一次。
- *      交接档被打开（handoverPercent > 0）时总是发「该写交接了」那条提醒；
- *      只有勾了 handoverTemplateEnabled 才落模板文件，并在提醒里追加「模板已生成：<路径>」；
- *      不勾则只提醒，文案里不出现这一行，文件早就存在也不提。
  *      「落进长期记忆」那句不探测 mnemon 在不在（mnemon 是唯一可选的插件依赖）。
- *      跨过 handover 这一档时**额外落一份交接模板文件**（只写文件，不塞进注入正文）：
- *      写在 clockFile 同目录，文件名 `交接-<yyyy-MM-dd>-<会话 id 后 8 位>.md`，
- *      已存在就不覆盖、不追加，注入里只追加一行指针 `模板已生成：<绝对路径>`。
- *      compactSoon / nearlyFull / ledger 不生成模板；范围外的会话不注入，也就不生成。
+ *
+ *      三档写的是**同一份交接文件**（只写文件，不塞进注入正文）：
+ *      写在 clockFile 同目录，文件名 `交接-<yyyy-MM-dd>-<会话 id 后 8 位>.md`。
+ *        - 交接档（首次写）：文件不存在就按五段模板新建（保留 `flag: 'wx'` 语义），
+ *          注入里追加一行 `模板已生成：<绝对路径>`；已存在就**不新建、不改内容**，
+ *          注入里追加 `交接已存在：<绝对路径>`——它本来就是首次写，跨线重复不重复写。
+ *        - 折叠 / 用完档（更新）：文件不存在就按五段模板新建（同样说「模板已生成」，
+ *          免得交接档没勾时文件整个缺失）；已存在就往末尾追加一段更新块
+ *          `## 更新 · <档位>%（HH:mm）`，注入里追加 `交接已更新：<绝对路径>`。
+ *      同一天同一场只该有一份交接，所以后两档是「更新」而不是「新建」。
+ *      范围外的会话不注入，也就不写文件。
  *   2. 按 clockIntervalHours 往 clockFile 追加一行 `YYYY-MM-DD HH:mm`，能读到水位时
  *      追加 ` 上下文 NN%`；进程启动时先补写一行。
  *   3. 换新提醒：**每次 pre-step 都检查**（不限第几步）；周期三选一（`rotateReminderMode`）：
@@ -67,7 +72,7 @@ import {
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { renderTemplate, templateFileName } from './lib/handover.js';
+import { renderTemplate, renderUpdateBlock, templateFileName } from './lib/handover.js';
 import { isRotateDue } from './lib/rotate-schedule.js';
 import {
   DEFAULT_SETTINGS,
@@ -96,11 +101,13 @@ export const inject = ['agents', 'tokenMeter'];
  *
  * 文案里的 X 是**当前占比**，不是阈值本身——同一档线在一次会话里只会被跨过一次。
  *
- * 这里只有 `percentKey`：**该百分比为 0 就表示这一档关闭**。
- * compactSoon / nearlyFull 另有 `enabledKey`（该档自己的勾）：勾没勾也算关闭，与填 0 等效。
- * 交接档没有 `enabledKey`——它的勾（handoverTemplateEnabled）管的是落模板文件，不是发不发提醒，
- * 所以在下面的循环里单独处理。某档关闭时整档跳过（不注入、不落模板），
- * 也**不占掉它的一次性名额**；其它档位不受影响。
+ * 这里只有 `percentKey`：**该百分比为 0 就表示这一档关闭**，整档跳过（不注入、不写文件）。
+ * 每一档还有一个「写交接」勾（`handoverKey`），但它**只管写/更新交接文件**，不决定提醒
+ * 发不发：百分比大于 0 时提醒照发，勾没勾只影响注入里出不出现「已生成 / 已更新」。
+ * `writeMode` 决定这一档的写盘动作：
+ *   - 'create'（交接档）：文件不存在才新建；已存在就不动，注入里说「交接已存在」；
+ *   - 'update'（折叠 / 用完档）：不存在就先按模板新建，存在就追加一段更新块。
+ * 关掉的档不占掉它的一次性名额；其它档位不受影响。
  *
  * 「写长期记忆」不在这张表里：它是独立一档（ledgerPercent），在循环后面单独判断，
  * 只注入一句话、不落文件，也不跟交接档绑定。
@@ -109,19 +116,22 @@ const REMINDERS = Object.freeze([
   {
     key: 'handover',
     percentKey: 'handoverPercent',
-    enabledKey: null,
+    handoverKey: 'handoverTemplateEnabled',
+    writeMode: 'create',
     text: (percent) => `上下文 ${percent}%：该写交接了——长任务先把结论落盘，再往下做。`,
   },
   {
     key: 'compactSoon',
     percentKey: 'compactSoonPercent',
-    enabledKey: 'compactSoonEnabled',
+    handoverKey: 'compactSoonHandoverEnabled',
+    writeMode: 'update',
     text: (percent) => `上下文 ${percent}%：快到折叠线了。折叠只留摘要，细节会丢；重要结论先落盘。`,
   },
   {
     key: 'nearlyFull',
     percentKey: 'nearlyFullPercent',
-    enabledKey: 'nearlyFullEnabled',
+    handoverKey: 'nearlyFullHandoverEnabled',
+    writeMode: 'update',
     text: (percent) => `上下文 ${percent}%：快满了，该换新会话了。`,
   },
 ]);
@@ -377,32 +387,70 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 到交接水位那一次落一份模板文件，返回可注入的绝对路径；写不出来返回 null。
+   * 交接文件的绝对路径；没有 clockFile 就没有落盘位置，返回 null。
    *
-   * - 目录取 `clockFile` 的目录（默认就是 `report-cache\`），不存在会建；
-   * - 文件名 `交接-<yyyy-MM-dd>-<会话 id 后 8 位>.md`，日期按进程本地时区
-   *   （clockFile 的 timeZone 只管时钟行，模板文件名跟着机器本地时间走，够用且不会歧义）；
-   * - **已存在就不覆盖、不追加**：用 `flag: 'wx'` 排他写，EEXIST 当作「之前生成过」，
-   *   照样返回路径 —— 注入里给的是指针，文件在不在比谁写的更重要；
-   * - 任何异常都吞掉，只往诊断日志写一行，绝不影响注入本身。
+   * 目录取 `clockFile` 的目录（默认就是 `report-cache\`），文件名
+   * `交接-<yyyy-MM-dd>-<会话 id 后 8 位>.md`，日期按进程本地时区
+   * （clockFile 的 timeZone 只管时钟行，文件名跟着机器本地时间走，够用且不会歧义）。
    */
-  function ensureHandoverTemplate(settings, sessionId) {
+  function handoverFilePath(settings, sessionId, now) {
     const clockFile = settings.clockFile;
     if (!clockFile) return null;
-    const directory = dirname(clockFile);
+    return resolve(dirname(clockFile), templateFileName(now, sessionId));
+  }
+
+  /**
+   * 更新块标题里的时刻 `HH:mm`：优先按配置的 timeZone（跟时钟行同一口径），
+   * 格式化器不可用时退回进程本地时间。
+   */
+  function clockTimeText(settings) {
+    const parts = localParts(settings.timeZone);
+    if (parts !== null) return parts[1];
     const now = new Date();
-    const file = resolve(directory, templateFileName(now, sessionId));
+    return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  }
+
+  /**
+   * 把某一档的交接动作落到磁盘上，返回要追加进注入的那一行指针；写不出来返回 null。
+   *
+   * - 交接档（writeMode 'create'）：不存在就按五段模板新建（`flag: 'wx'`，保留
+   *   「已存在就不覆盖」的语义），返回 `模板已生成：<路径>`；已存在就**不新建、不改内容**，
+   *   返回 `交接已存在：<路径>`——它本来就是首次写，跨线重复不重复写。
+   * - 折叠 / 用完档（writeMode 'update'）：不存在就先按模板新建（并说「模板已生成」，
+   *   免得交接档没勾时整份文件缺失）；存在就**追加**一段更新块，返回 `交接已更新：<路径>`。
+   *
+   * 追加用 appendFileSync，并在更新块前补一个空行，免得和上文粘在一起。
+   * 任何异常都吞掉，只往诊断日志写一行，绝不影响注入本身。
+   */
+  function writeHandoverForTier(settings, sessionId, reminder) {
+    const now = new Date();
+    const file = handoverFilePath(settings, sessionId, now);
+    if (file === null) return null;
     try {
-      mkdirSync(directory, { recursive: true });
-      writeFileSync(file, renderTemplate(now, sessionId), { encoding: 'utf8', flag: 'wx' });
-      diag(`handover template created=${file}`);
-      return file;
-    } catch (err) {
-      if (err?.code === 'EEXIST') {
-        diag(`handover template exists=${file}`);
-        return file;
+      mkdirSync(dirname(file), { recursive: true });
+      let created = false;
+      try {
+        writeFileSync(file, renderTemplate(now, sessionId), { encoding: 'utf8', flag: 'wx' });
+        created = true;
+      } catch (err) {
+        // EEXIST = 之前写过（可能是交接档写的，也可能是同一天跨线重复触发），往下走
+        if (err?.code !== 'EEXIST') throw err;
       }
-      diag(`handover template failed=${file} ${String(err?.message ?? err)}`);
+      if (created) {
+        diag(`handover template created=${file}`);
+        return `模板已生成：${file}`;
+      }
+      if (reminder.writeMode === 'create') {
+        // 交接档本来就只负责首次写：文件在就不动，只给个指针
+        diag(`handover template exists=${file}`);
+        return `交接已存在：${file}`;
+      }
+      const block = `\n${renderUpdateBlock(settings[reminder.percentKey], clockTimeText(settings))}`;
+      appendFileSync(file, block, 'utf8');
+      diag(`handover updated percent=${settings[reminder.percentKey]} file=${file}`);
+      return `交接已更新：${file}`;
+    } catch (err) {
+      diag(`handover write failed file=${file} ${String(err?.message ?? err)}`);
       return null;
     }
   }
@@ -465,25 +513,21 @@ export function apply(ctx, config) {
       }
       // 跨过新的一档时不管第几步都额外说一次，每档每会话只说一次。
       // 每一档先看自己的百分比：为 0 就表示这一档关闭，整档跳过、连「已提醒」都不记——
-      // 不占掉它的一次性名额，中途把它改回大于 0 还能补上。折叠 / 用完两档再看它们自己的勾：
-      // 勾没勾也算关闭（与填 0 等效），同样不记名额。别的档位、读数、时钟行、换新提醒全不受影响。
-      // handover 这一档额外落一份模板文件（只写文件），文案里再追加一行指针；
-      // 模板受 handoverTemplateEnabled 管：不勾时只发提醒，文案里不提「模板已生成」，
-      // 哪怕文件之前已经生成过也不提。模板只在 handover 生成；其它档只提醒。
+      // 不占掉它的一次性名额，中途把它改回大于 0 还能补上。
+      // 「写交接」勾只决定要不要写/更新交接文件，**不决定提醒发不发**：
+      // 勾着才写盘，并在文案里追加一行「已生成 / 已更新」；不勾就只发提醒，文案里不出现那行。
+      // 三档写的是同一份文件：交接档首次写、折叠 / 用完档追加更新块（见 writeHandoverForTier）。
       for (const reminder of REMINDERS) {
         const threshold = settings[reminder.percentKey];
         // 0 = 关闭这一档（normalizeSettings 已保证是 0–100 的整数）
         if (!(threshold > 0)) continue;
-        // 折叠 / 用完两档的勾：未勾 = 关闭这一档
-        if (reminder.enabledKey !== null && settings[reminder.enabledKey] !== true) continue;
         if (watermark.percent < threshold || seen.has(reminder.key)) continue;
         seen.add(reminder.key);
         let text = reminder.text(watermark.percent);
-        if (reminder.key === 'handover' && settings.handoverTemplateEnabled) {
-          // 交接档的勾只管落模板：不勾就走不到这里，提醒照发、只是少了这一行
-          const templateFile = ensureHandoverTemplate(settings, sessionId);
+        if (settings[reminder.handoverKey] === true) {
           // 写失败就只是少了这一行：提醒照发，不假装文件已经在了
-          if (templateFile !== null) text += `\n模板已生成：${templateFile}`;
+          const handoverLine = writeHandoverForTier(settings, sessionId, reminder);
+          if (handoverLine !== null) text += `\n${handoverLine}`;
         }
         texts.push(text);
       }
